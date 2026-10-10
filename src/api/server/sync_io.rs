@@ -5,6 +5,8 @@
 
 use std::io::{self, IoSlice, Read, Write};
 use std::mem::size_of;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use vm_memory::ByteValued;
@@ -778,6 +780,10 @@ impl<F: FileSystem + Sync> Server<F> {
                     out.max_pages = MAX_REQ_PAGES;
                     out.max_write = MAX_REQ_PAGES as u32 * pagesize() as u32; // 1MB
                 }
+                #[cfg(target_os = "linux")]
+                if enabled.contains(FsOptions::PASSTHROUGH) {
+                    out.max_stack_depth = self.max_stack_depth.load(Ordering::Relaxed);
+                }
                 let vers = ServerVersion { major, minor };
                 self.vers.store(Arc::new(vers));
                 if minor < KERNEL_MINOR_VERSION_INIT_OUT_SIZE {
@@ -1441,21 +1447,19 @@ mod tests {
         use crate::transport::FuseBuf;
 
         use std::fs::File;
+        use std::io::{Seek, SeekFrom};
         use std::os::unix::io::AsRawFd;
         use vmm_sys_util::tempfile::TempFile;
 
-        fn prepare_srvcontext<'a>(
+        fn prepare_srvcontext<'a, F: FileSystem + Sync>(
             read_buf: &'a mut [u8],
             write_buf: &'a mut [u8],
-        ) -> (SrvContext<'a, PassthroughFs>, File) {
+        ) -> (SrvContext<'a, F>, File) {
             let file = TempFile::new().unwrap().into_file();
             let reader = Reader::<()>::from_fuse_buffer(FuseBuf::new(read_buf)).unwrap();
             let writer = FuseDevWriter::<()>::new(file.as_raw_fd(), write_buf).unwrap();
             let in_header = InHeader::default();
-            (
-                SrvContext::<PassthroughFs>::new(in_header, reader, writer.into()),
-                file,
-            )
+            (SrvContext::<F>::new(in_header, reader, writer.into()), file)
         }
 
         #[test]
@@ -1486,6 +1490,46 @@ mod tests {
 
             let res = server.init(ctx1).unwrap();
             assert_eq!(res, 24);
+        }
+
+        #[test]
+        fn test_server_init_passthrough() {
+            struct Fs;
+            impl FileSystem for Fs {
+                type Inode = u64;
+                type Handle = u64;
+                fn init(&self, _capable: FsOptions) -> io::Result<FsOptions> {
+                    Ok(FsOptions::INIT_EXT | FsOptions::PASSTHROUGH)
+                }
+            }
+
+            let server = Server::new(Fs);
+            server.set_max_stack_depth(2);
+
+            let init_in = InitIn {
+                major: KERNEL_VERSION,
+                minor: 40,
+                max_readahead: 0,
+                flags: FsOptions::INIT_EXT.bits() as u32,
+            };
+            let init_in2 = InitIn2 {
+                flags2: (FsOptions::PASSTHROUGH.bits() >> 32) as u32,
+                unused: [0; 11],
+            };
+            let mut read_buf = [init_in.as_slice(), init_in2.as_slice()].concat();
+            let mut write_buf = [0u8; 4096];
+            let (ctx, mut file) = prepare_srvcontext(&mut read_buf, &mut write_buf);
+
+            let res = server.init(ctx).unwrap();
+            assert_eq!(res, size_of::<OutHeader>() + size_of::<InitOut>());
+
+            let mut reply = Vec::new();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.read_to_end(&mut reply).unwrap();
+            let out = InitOut::from_slice(&reply[size_of::<OutHeader>()..]).unwrap();
+            assert_ne!(out.flags as u64 & FsOptions::INIT_EXT.bits(), 0);
+            assert_eq!((out.flags2 as u64) << 32, FsOptions::PASSTHROUGH.bits());
+            assert_eq!(out.max_stack_depth, 2);
         }
 
         #[test]

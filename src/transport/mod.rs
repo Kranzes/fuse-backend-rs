@@ -41,6 +41,8 @@ mod fusedev;
 mod virtiofs;
 
 pub use self::fs_cache_req_handler::FsCacheReqHandler;
+#[cfg(all(feature = "fusedev", target_os = "linux"))]
+pub use self::fusedev::{fuse_backing_close, fuse_backing_open};
 #[cfg(feature = "fusedev")]
 pub use self::fusedev::{FuseBuf, FuseChannel, FuseDevWriter, FuseSession, FuseSessionExt};
 #[cfg(feature = "virtiofs")]

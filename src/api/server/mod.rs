@@ -20,6 +20,8 @@ use std::ffi::CStr;
 use std::io::{self, Read};
 use std::marker::PhantomData;
 use std::mem::size_of;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -51,6 +53,8 @@ pub const MAX_REQ_PAGES: u16 = 256; // 1MB
 pub struct Server<F: FileSystem + Sync> {
     fs: F,
     vers: ArcSwap<ServerVersion>,
+    #[cfg(target_os = "linux")]
+    max_stack_depth: AtomicU32,
 }
 
 impl<F: FileSystem + Sync> Server<F> {
@@ -62,7 +66,18 @@ impl<F: FileSystem + Sync> Server<F> {
                 major: KERNEL_VERSION,
                 minor: KERNEL_MINOR_VERSION,
             })),
+            #[cfg(target_os = "linux")]
+            max_stack_depth: AtomicU32::new(1),
         }
+    }
+
+    /// Set the max stack depth of the filesystem sent in the INIT reply when
+    /// `FsOptions::PASSTHROUGH` is enabled. The default of 1 allows backing files on a
+    /// filesystem that isn't stacked, and 2 allows them on a stacked one such as overlayfs.
+    /// Call it before the server handles the INIT request.
+    #[cfg(target_os = "linux")]
+    pub fn set_max_stack_depth(&self, depth: u32) {
+        self.max_stack_depth.store(depth, Ordering::Relaxed);
     }
 }
 
