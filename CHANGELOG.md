@@ -52,6 +52,9 @@
   writes of opens that ask for it with zero-copy. It moves the data between the client's pages
   and the file with io_uring fixed-buffer operations. It needs buffer pools and CAP_SYS_ADMIN,
   and serves without it otherwise. `UringConfig` has a new field.
+- `async_runtime::set_runtime_type()` selects the asynchronous runtime type in code, because
+  setting `FUSE_BACKEND_RS_ASYNC_RUNTIME` from a running program isn't safe.
+  `async_runtime::runtime_type()` returns the type in effect, and `RuntimeType` is now public.
 
 ### Changed
 - The FUSE-over-io_uring transport answers opcodes it doesn't know with ENOSYS instead of EIO.
