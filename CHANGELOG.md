@@ -35,6 +35,8 @@
 - `Server::init_state()` and `Server::restore_init()` let a new server take over a connection
   that another server initialized. `abi::fuse_abi::UNIQUE_RESEND` is the bit that the kernel
   sets in requests it sends again after `notify_resend()`.
+- `UringWriter` implements the asynchronous `Writer` methods, so the async server can reply
+  through the FUSE-over-io_uring transport.
 
 ### Changed
 - With the tokio runtime, `FuseDevTask` no longer retries reads in a loop. It waits for requests
@@ -49,6 +51,8 @@
 - The FUSE-over-io_uring transport answers opcodes it doesn't know with ENOSYS instead of EIO.
   Kernels that send `FUSE_STATX` only fall back to `FUSE_GETATTR` after ENOSYS, so `statx()`
   calls that ask for more than the basic fields, like the birth time `stat(1)` shows, failed.
+- `UringWriter::write_from_at()` fails when the data doesn't fit into the reply body. It used to
+  count free space in the header slot too, and could write past the end of the body.
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): `fuse-backend-rs` is now a thin facade re-exporting the sub-crates. Every
   historical `fuse_backend_rs::{abi, api, buffer, common, transport, passthrough,
   overlayfs}` import path and cargo feature name (`fusedev`, `virtiofs`,
