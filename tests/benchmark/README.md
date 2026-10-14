@@ -62,7 +62,15 @@ The fio results are written in JSON format to a temporary results directory
 summary is printed at the end. The default execution order is sync then
 async; the second mode benefits from a warmer page cache, so cross-check
 with `MODES="async sync"`. The uring mode is included with
-`MODES="sync async uring"`.
+`MODES="sync async uring"`, and `uring_async` serves the same transport
+with the asynchronous handlers (`UringFuseServing::new_async`).
+
+`DAEMON_ARGS` passes extra arguments to the daemon in every mode. With
+`DAEMON_ARGS="--delay-us 1000"`, every LOOKUP and READ waits 1 ms before it
+is served, as if the file system fetched from a remote store. The
+synchronous handlers block their worker for that time, while the
+asynchronous ones keep serving other requests, so the random read workload
+shows how many requests each mode overlaps.
 
 To quantify the difference between the transports, collect each mode's
 results and compare the collected files — `bench_compare.py` is

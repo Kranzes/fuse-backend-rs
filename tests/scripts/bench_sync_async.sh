@@ -7,17 +7,19 @@
 # fuse-backend-rs using fio.
 #
 # For each mode (sync: N worker threads, async: one FuseDevTask on the
-# async runtime, uring: the experimental FUSE-over-io_uring transport),
+# async runtime, uring: the experimental FUSE-over-io_uring transport,
+# uring_async: the same transport with the asynchronous handlers),
 # the script mounts the benchmark daemon and runs the same fio workloads
 # against the mountpoint. The fio results are stored in JSON format
 # ($RESULTS_DIR/<mode>-<workload>.json) under $RESULTS_DIR for further
-# analysis, see tests/scripts/bench_compare.py.
+# analysis, see tests/scripts/bench_compare.py. Mode names contain no "-",
+# so the "<mode>-" prefix of one mode never matches another mode's files.
 #
 # Requirements: Linux, fio, jq, python3, permission to mount fuse (root or
-# fusermount). The uring mode additionally requires kernel 6.14+ with
-# FUSE-over-io_uring enabled (the fuse module parameter enable_uring,
+# fusermount). The uring and uring_async modes additionally require kernel
+# 6.14+ with FUSE-over-io_uring enabled (the fuse module parameter enable_uring,
 # which the script tries to turn on when it is writable); kernels that
-# reject the transport during the INIT handshake make the mode be
+# reject the transport during the INIT handshake make these modes be
 # skipped with a warning.
 #
 # Tunables (environment variables):
@@ -35,6 +37,8 @@
 #            pipeline to benchmark different code variants with an
 #            identical workload definition
 #   RESULTS_DIR where to store results (default a fresh mktemp directory)
+#   DAEMON_ARGS extra arguments for the daemon in every mode, such as
+#            "--delay-us 1000" to make every LOOKUP and READ wait 1 ms
 
 set -euo pipefail
 
@@ -50,6 +54,7 @@ SIZE=${SIZE:-256M}
 RUNTIME=${RUNTIME:-30}
 NRFILES=${NRFILES:-50000}
 MODES=${MODES:-"sync async"}
+DAEMON_ARGS=${DAEMON_ARGS:-}
 RESULTS_DIR=${RESULTS_DIR:-$(mktemp -d /tmp/fuse-bench-results.XXXXXX)}
 SRC_DIR="${RESULTS_DIR}/source"
 MNT_DIR="${RESULTS_DIR}/mount"
@@ -113,7 +118,7 @@ trap cleanup EXIT
 start_daemon() {
     local mode_args=$1
     # shellcheck disable=SC2086
-    "${DAEMON}" "${SRC_DIR}" "${MNT_DIR}" ${mode_args} --threads "${THREADS}" &
+    "${DAEMON}" "${SRC_DIR}" "${MNT_DIR}" ${mode_args} --threads "${THREADS}" ${DAEMON_ARGS} &
     DAEMON_PID=$!
     for _ in $(seq 50); do
         # A daemon that mounted and immediately died (rejected session)
@@ -212,11 +217,17 @@ run_readdir_workload() {
 
 # shellcheck disable=SC2086
 for mode in ${MODES}; do
-    mode_args=""
-    [ "${mode}" = "async" ] && mode_args="--async"
-    if [ "${mode}" = "uring" ]; then
+    is_uring=false
+    case "${mode}" in
+        async) mode_args="--async" ;;
+        uring) mode_args="--uring"; is_uring=true ;;
+        uring_async) mode_args="--uring --async"; is_uring=true ;;
+        sync) mode_args="" ;;
+        *) echo "error: unknown mode ${mode}" >&2; exit 1 ;;
+    esac
+    if ${is_uring}; then
         if ! kernel_at_least 6 14; then
-            echo "warning: mode uring requires kernel 6.14+ ($(uname -r)), skipping" >&2
+            echo "warning: mode ${mode} requires kernel 6.14+ ($(uname -r)), skipping" >&2
             continue
         fi
         # Kernels >= 6.14 may still reject FUSE-over-io_uring: the fuse
@@ -227,7 +238,6 @@ for mode in ${MODES}; do
         if [ -e /sys/module/fuse/parameters/enable_uring ]; then
             ( echo 1 > /sys/module/fuse/parameters/enable_uring ) 2>/dev/null || true
         fi
-        mode_args="--uring"
     fi
 
     echo ""
@@ -235,8 +245,8 @@ for mode in ${MODES}; do
     if ! start_daemon "${mode_args}"; then
         # Drop a possibly stale mount left by the failed daemon.
         umount "${MNT_DIR}" 2>/dev/null || true
-        if [ "${mode}" = "uring" ]; then
-            echo "warning: FUSE-over-io_uring is not available on this kernel, skipping mode uring" >&2
+        if ${is_uring}; then
+            echo "warning: FUSE-over-io_uring is not available on this kernel, skipping mode ${mode}" >&2
             continue
         fi
         echo "error: daemon did not mount ${MNT_DIR}" >&2
