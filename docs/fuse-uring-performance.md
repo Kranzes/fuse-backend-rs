@@ -169,12 +169,20 @@ three times:
 | own per entry | 1492 MiB | 393 MiB | 1518-1728 MiB/s |
 | 4 | 431 MiB | 106 MiB | 1588-1709 MiB/s |
 
-VmSize also counts the request and reply scratch areas of each entry,
-which are as large as its own payload buffer, so a pooled entry saves
-those too. Random 4 KiB reads in the same setup ran at 44.5k to 46.8k
+When this was measured, each entry also had request and reply scratch
+areas as large as its own payload buffer, which VmSize counts. Entries
+now keep 168 bytes of scratch. Random 4 KiB reads in the same setup ran at 44.5k to 46.8k
 IOPS with and without pools. VmRSS counts only the pages that requests
 touched, so workloads with fewer requests in flight use far less memory
 than this.
+
+The kernel hands a request to the entry of its queue that became free last,
+and once its buffers are busy, an entry that commits takes the next waiting
+request with the buffer it already holds. So the entries that get the
+buffers first keep them under load. The workers register their entries in
+rounds, so that those entries belong to different workers. Without the
+rounds, 1 MiB reads in the setup above ran at 530 to 1050 MiB/s, because the
+worker that registered last served every queue alone.
 
 ## Zero-copy
 
