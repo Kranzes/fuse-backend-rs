@@ -6,7 +6,7 @@
 //! A minimal fusedev passthrough daemon used to benchmark the synchronous
 //! and asynchronous IO paths with external tools such as fio.
 //!
-//! Usage: `fuse-backend-rs-benchmark <src> <mountpoint> [--async|--uring] [--threads N] [--sync-blocking] [--uring-bufs N] [--uring-zero-copy] [--no-backing-direct-io]`
+//! Usage: `fuse-backend-rs-benchmark <src> <mountpoint> [--async] [--uring] [--threads N] [--sync-blocking] [--uring-bufs N] [--uring-zero-copy] [--no-backing-direct-io] [--delay-us N]`
 //!
 //! - default (sync) mode: requests are served by `N` worker threads of the
 //!   `SyncFuseServing` serving layer, each reading from its own fuse channel
@@ -24,11 +24,22 @@
 //!   entry a buffer of its own. `--uring-zero-copy` serves reads and writes
 //!   with zero-copy (`UringConfig::zero_copy` and
 //!   `Config::uring_zero_copy`), which needs CAP_SYS_ADMIN.
+//! - `--uring --async` mode: requests are served through FUSE-over-io_uring
+//!   with the asynchronous handlers (`UringFuseServing::new_async`), and
+//!   each of the `N` workers keeps several requests in flight.
 //!
 //! `--no-backing-direct-io` opens the backing files without O_DIRECT even when
 //! the client asks for it (`Config::allow_direct_io = false`). Requests of a
 //! client that opens with O_DIRECT still reach the daemon as direct IO, and
 //! opens without O_DIRECT on the backing file can use zero-copy.
+//!
+//! `--delay-us N` makes every LOOKUP and READ wait `N` microseconds before
+//! it is served, like a backend that fetches from a remote store. The
+//! synchronous handlers block their thread for that time, the asynchronous
+//! ones sleep without blocking it.
+
+#[cfg(target_os = "linux")]
+mod delay;
 
 #[cfg(target_os = "linux")]
 mod daemon {
@@ -37,18 +48,23 @@ mod daemon {
     use std::io::{Error, Result};
     use std::path::Path;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use log::{error, info, LevelFilter};
     use signal_hook::{consts::TERM_SIGNALS, iterator::Signals};
     use simple_logger::SimpleLogger;
 
+    use fuse_backend_rs::api::filesystem::AsyncFileSystem;
     use fuse_backend_rs::api::server::Server;
     use fuse_backend_rs::api::{Vfs, VfsOptions};
     use fuse_backend_rs::passthrough::{Config, PassthroughFs};
+
     use fuse_backend_rs::transport::{
         AsyncFuseServing, AsyncServingConfig, FuseSession, SyncFuseServing, SyncServingConfig,
         UringConfig, UringFuseServing,
     };
+
+    use crate::delay::DelayFs;
 
     struct Args {
         src: String,
@@ -60,12 +76,21 @@ mod daemon {
         uring_bufs: usize,
         uring_zero_copy: bool,
         backing_direct_io: bool,
+        delay: Duration,
     }
 
     fn help() {
         println!(
-            "Usage:\n   fuse-backend-rs-benchmark <src> <mountpoint> [--async|--uring] [--threads N] [--sync-blocking] [--uring-bufs N] [--uring-zero-copy] [--no-backing-direct-io]\n"
+            "Usage:\n   fuse-backend-rs-benchmark <src> <mountpoint> [--async] [--uring] [--threads N] [--sync-blocking] [--uring-bufs N] [--uring-zero-copy] [--no-backing-direct-io] [--delay-us N]\n"
         );
+    }
+
+    /// Parse the value of the option at `args[idx]`.
+    fn option_value<T: std::str::FromStr>(args: &[String], idx: usize) -> Result<T> {
+        args.get(idx).and_then(|v| v.parse().ok()).ok_or_else(|| {
+            help();
+            Error::from_raw_os_error(libc::EINVAL)
+        })
     }
 
     fn parse_args() -> Result<Args> {
@@ -84,6 +109,7 @@ mod daemon {
             uring_bufs: UringConfig::default().bufs_per_queue,
             uring_zero_copy: false,
             backing_direct_io: true,
+            delay: Duration::ZERO,
         };
         let mut idx = 3;
         while idx < args.len() {
@@ -93,24 +119,17 @@ mod daemon {
                 "--sync-blocking" => res.sync_blocking = true,
                 "--threads" => {
                     idx += 1;
-                    if idx >= args.len() {
-                        help();
-                        return Err(Error::from_raw_os_error(libc::EINVAL));
-                    }
-                    res.thread_cnt = args[idx].parse().map_err(|_| {
-                        help();
-                        Error::from_raw_os_error(libc::EINVAL)
-                    })?;
+                    res.thread_cnt = option_value(&args, idx)?;
+                }
+                "--delay-us" => {
+                    idx += 1;
+                    res.delay = Duration::from_micros(option_value(&args, idx)?);
                 }
                 "--uring-zero-copy" => res.uring_zero_copy = true,
                 "--no-backing-direct-io" => res.backing_direct_io = false,
                 "--uring-bufs" => {
                     idx += 1;
-                    res.uring_bufs =
-                        args.get(idx).and_then(|v| v.parse().ok()).ok_or_else(|| {
-                            help();
-                            Error::from_raw_os_error(libc::EINVAL)
-                        })?;
+                    res.uring_bufs = option_value(&args, idx)?;
                 }
                 _ => {
                     help();
@@ -128,18 +147,10 @@ mod daemon {
             help();
             return Err(Error::from_raw_os_error(libc::EINVAL));
         }
-        if res.as_async && res.as_uring {
-            help();
-            return Err(Error::from_raw_os_error(libc::EINVAL));
-        }
         Ok(res)
     }
 
-    fn create_server(
-        src: &str,
-        uring_zero_copy: bool,
-        allow_direct_io: bool,
-    ) -> Arc<Server<Arc<Vfs>>> {
+    fn create_vfs(src: &str, uring_zero_copy: bool, allow_direct_io: bool) -> Arc<Vfs> {
         let vfs = Vfs::new(VfsOptions {
             no_open: false,
             no_opendir: false,
@@ -157,12 +168,17 @@ mod daemon {
         fs.import().unwrap();
 
         vfs.mount(Box::new(fs), "/").unwrap();
-        Arc::new(Server::new(Arc::new(vfs)))
+        Arc::new(vfs)
     }
 
     /// Serve requests with `thread_cnt` synchronous worker threads until a
     /// termination signal is received.
-    fn run_sync(server: Arc<Server<Arc<Vfs>>>, se: FuseSession, thread_cnt: u32, blocking: bool) {
+    fn run_sync<F: AsyncFileSystem + Send + Sync + 'static>(
+        server: Arc<Server<F>>,
+        se: FuseSession,
+        thread_cnt: u32,
+        blocking: bool,
+    ) {
         let cfg = SyncServingConfig {
             workers: thread_cnt as usize,
             blocking,
@@ -184,7 +200,11 @@ mod daemon {
 
     /// Serve requests with `thread_cnt` asynchronous workers until a
     /// termination signal is received.
-    fn run_async(server: Arc<Server<Arc<Vfs>>>, se: FuseSession, thread_cnt: u32) {
+    fn run_async<F: AsyncFileSystem + Send + Sync + 'static>(
+        server: Arc<Server<F>>,
+        se: FuseSession,
+        thread_cnt: u32,
+    ) {
         let cfg = AsyncServingConfig {
             workers: thread_cnt as usize,
             ..Default::default()
@@ -207,24 +227,28 @@ mod daemon {
     /// Serve requests through the FUSE-over-io_uring transport until a
     /// termination signal is received. Requires kernel 6.14+ with the
     /// fuse module parameter enable_uring turned on; `UringFuseServing::new()`
-    /// fails otherwise.
-    fn run_uring(
-        server: Arc<Server<Arc<Vfs>>>,
+    /// fails otherwise. With `as_async`, the workers serve with the
+    /// asynchronous handlers.
+    fn run_uring<F: AsyncFileSystem + Send + Sync + 'static>(
+        server: Arc<Server<F>>,
         se: FuseSession,
-        thread_cnt: u32,
-        bufs_per_queue: usize,
-        zero_copy: bool,
+        args: &Args,
     ) {
         // set_uring() must be called before the INIT handshake, which
         // UringFuseServing::new() performs on the mounted session.
         server.set_uring(true);
         let cfg = UringConfig {
-            workers: thread_cnt as usize,
+            workers: args.thread_cnt as usize,
             entries_per_queue: 16,
-            bufs_per_queue,
-            zero_copy,
+            bufs_per_queue: args.uring_bufs,
+            zero_copy: args.uring_zero_copy,
         };
-        let serving = match UringFuseServing::new(se, server, cfg) {
+        let serving = if args.as_async {
+            UringFuseServing::new_async(se, server, cfg)
+        } else {
+            UringFuseServing::new(se, server, cfg)
+        };
+        let serving = match serving {
             Ok(serving) => serving,
             Err(e) => {
                 error!(
@@ -242,6 +266,22 @@ mod daemon {
         // Dropping the serving layer unmounts the session and joins all
         // serving threads.
         drop(serving);
+    }
+
+    /// Serve with the serving layer `args` selects until a termination
+    /// signal is received.
+    fn serve<F: AsyncFileSystem + Send + Sync + 'static>(
+        server: Arc<Server<F>>,
+        se: FuseSession,
+        args: &Args,
+    ) {
+        if args.as_uring {
+            run_uring(server, se, args);
+        } else if args.as_async {
+            run_async(server, se, args.thread_cnt);
+        } else {
+            run_sync(server, se, args.thread_cnt, args.sync_blocking);
+        }
     }
 
     pub fn main() -> Result<()> {
@@ -263,10 +303,12 @@ mod daemon {
             }
         }
         info!(
-            "passthrough src {} mountpoint {} mode {} threads {}",
+            "passthrough src {} mountpoint {} mode {} threads {} delay {:?}",
             args.src,
             args.dest,
-            if args.as_uring {
+            if args.as_uring && args.as_async {
+                "uring_async"
+            } else if args.as_uring {
                 "uring"
             } else if args.as_async {
                 "async"
@@ -276,24 +318,23 @@ mod daemon {
                 "sync"
             },
             args.thread_cnt,
+            args.delay,
         );
 
-        let server = create_server(&args.src, args.uring_zero_copy, args.backing_direct_io);
+        let vfs = create_vfs(&args.src, args.uring_zero_copy, args.backing_direct_io);
         let mut se = FuseSession::new(Path::new(&args.dest), "bench_passthru", "", false).unwrap();
         se.mount().unwrap();
 
-        if args.as_uring {
-            run_uring(
-                server,
-                se,
-                args.thread_cnt,
-                args.uring_bufs,
-                args.uring_zero_copy,
-            );
-        } else if args.as_async {
-            run_async(server, se, args.thread_cnt);
+        // Serve the Vfs directly without a delay, so those numbers stay
+        // comparable with runs from before the delay option.
+        if args.delay.is_zero() {
+            serve(Arc::new(Server::new(vfs)), se, &args);
         } else {
-            run_sync(server, se, args.thread_cnt, args.sync_blocking);
+            serve(
+                Arc::new(Server::new(DelayFs::new(vfs, args.delay))),
+                se,
+                &args,
+            );
         }
 
         Ok(())
