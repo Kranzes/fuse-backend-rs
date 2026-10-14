@@ -58,6 +58,8 @@
 - `Server::init_state()` and `Server::restore_init()` let a new server take over a connection
   that another server initialized. `abi::fuse_abi::UNIQUE_RESEND` is the bit that the kernel
   sets in requests it sends again after `notify_resend()`.
+- `UringWriter` implements the asynchronous `Writer` methods, so the async server can reply
+  through the FUSE-over-io_uring transport.
 
 ### Changed
 - The FUSE-over-io_uring transport answers opcodes it doesn't know with ENOSYS instead of EIO.
