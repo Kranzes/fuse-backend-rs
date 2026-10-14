@@ -53,6 +53,9 @@
   calls that ask for more than the basic fields, like the birth time `stat(1)` shows, failed.
 - `UringWriter::write_from_at()` fails when the data doesn't fit into the reply body. It used to
   count free space in the header slot too, and could write past the end of the body.
+- A stopping `UringFuseServing` worker waits until the kernel gives back its ring entries before
+  it frees them, and leaks them if that takes more than a second. Before, the kernel could copy
+  a request into freed memory. Each entry also uses about a third of the memory it used to.
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): `fuse-backend-rs` is now a thin facade re-exporting the sub-crates. Every
   historical `fuse_backend_rs::{abi, api, buffer, common, transport, passthrough,
   overlayfs}` import path and cargo feature name (`fusedev`, `virtiofs`,

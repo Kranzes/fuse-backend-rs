@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use vm_memory::ByteValued;
@@ -201,7 +202,7 @@ fn in_args_len(opcode: u32) -> Option<usize> {
         47 => 56,      // COPY_FILE_RANGE: CopyFileRangeIn
         // SETUPMAPPING/REMOVEMAPPING only exist on the virtiofs DAX window
         // path and are never delivered through /dev/fuse, opcodes 0, 7 and
-        // 19 are undefined, and process() answers the rest, such as
+        // 19 are undefined, and request() answers the rest, such as
         // SYNCFS, TMPFILE and STATX, with ENOSYS.
         _ => return None,
     };
@@ -538,12 +539,20 @@ impl<'a, S: BitmapSlice> Writer for UringWriter<'a, S> {
 // UringWriter holds ManuallyDrop Vec shells, so dropping
 // the writer never frees the memory.
 
-/// One ring entry: the memory areas the kernel reads/writes plus scratch
-/// regions used to reassemble requests and collect replies.
+/// Size of an entry's request scratch: the in header plus the largest fixed
+/// arguments a request can carry in `op_in`.
+const REQ_SCRATCH_SIZE: usize = IN_HEADER_SIZE + FUSE_URING_IN_OUT_HEADER_SZ;
+
+/// A delivered request: its unique id, and the Reader and UringWriter over
+/// the entry that holds it.
+type Request<'a> = (u64, Reader<'a, ()>, UringWriter<'a, ()>);
+
+/// One ring entry: the memory areas the kernel reads/writes plus a scratch
+/// region used to reassemble the request header and fixed arguments.
 struct UringEntry {
     qid: u16,
     /// Single allocation, laid out as
-    /// [FuseUringReqHeader][payload][request scratch][reply scratch].
+    /// [FuseUringReqHeader][payload][request scratch of REQ_SCRATCH_SIZE].
     mem: Box<[u8]>,
     payload_cap: usize,
     /// iovec array referenced by the SQEs, must stay at a stable address.
@@ -552,8 +561,7 @@ struct UringEntry {
 
 impl UringEntry {
     fn new(qid: u16, payload_cap: usize) -> UringEntry {
-        let scratch = FUSE_HEADER_SIZE + payload_cap;
-        let total = std::mem::size_of::<FuseUringReqHeader>() + payload_cap + 2 * scratch;
+        let total = std::mem::size_of::<FuseUringReqHeader>() + payload_cap + REQ_SCRATCH_SIZE;
         let mem = vec![0u8; total].into_boxed_slice();
         let base = mem.as_ptr();
         let iovecs = Box::new([
@@ -623,22 +631,113 @@ impl UringEntry {
         sqe.user_data(user_data)
     }
 
+    /// The header of the request the kernel delivered into this entry.
+    fn in_header(&self) -> InHeader {
+        let mut hdr = InHeader::default();
+        hdr.as_mut_slice()
+            .copy_from_slice(&self.header().in_out[..IN_HEADER_SIZE]);
+        hdr
+    }
+
     /// Stage a `-errno` error reply, so that the subsequent
     /// `COMMIT_AND_FETCH` hands the client a proper error instead of the
     /// request data still sitting in the entry areas.
     fn stage_error_reply(&mut self, errno: i32) {
-        let header = self.header_mut();
-        let mut in_hdr = InHeader::default();
-        in_hdr
-            .as_mut_slice()
-            .copy_from_slice(&header.in_out[..IN_HEADER_SIZE]);
+        // A partial reply may have overwritten the in header by now, but the
+        // out header keeps `unique` at the same offset.
         let out = OutHeader {
             len: OUT_HEADER_SIZE as u32,
             error: -errno,
-            unique: in_hdr.unique,
+            unique: self.in_header().unique,
         };
+        let header = self.header_mut();
         header.in_out[..OUT_HEADER_SIZE].copy_from_slice(out.as_slice());
         header.ring_ent_in_out.payload_sz = 0;
+    }
+
+    /// Check the request the kernel delivered into this entry, and build
+    /// the Reader over it and the UringWriter for its reply.
+    ///
+    /// This copies the fixed arguments behind the in header into the
+    /// request scratch. The payload, up to `payload_cap` bytes, stays in the
+    /// payload area, and the Reader reads it there. The writer puts the
+    /// reply header into the `in_out` slot and the reply body into the
+    /// payload area, so nothing is copied afterwards. Both borrow the entry
+    /// until the request has been handled. Returns the request's unique id
+    /// with them, or `None` if the entry already holds the reply.
+    fn request(&mut self) -> Result<Option<Request<'_>>> {
+        let in_header = self.in_header();
+        // Answer an opcode the table doesn't know with ENOSYS here, rather
+        // than dispatch it without its arguments. The kernel then stops
+        // sending it, as it does with FUSE_STATX.
+        let Some(args_len) = in_args_len(in_header.opcode) else {
+            self.stage_error_reply(libc::ENOSYS);
+            return Ok(None);
+        };
+        let payload_sz = self.header().ring_ent_in_out.payload_sz as usize;
+        if args_len > FUSE_URING_IN_OUT_HEADER_SZ || payload_sz > self.payload_cap {
+            return Err(SessionFailure(format!(
+                "uring: malformed request, opcode {} args {} payload {}",
+                in_header.opcode, args_len, payload_sz
+            )));
+        }
+
+        let header_len = std::mem::size_of::<FuseUringReqHeader>();
+        let base = self.mem.as_mut_ptr();
+        // Safe because the entry allocation holds the request header, then
+        // the payload area, then the request scratch, which fits the in
+        // header plus the largest fixed arguments checked above.
+        //
+        // The Reader's payload and the Writer's body are mutable slices over
+        // the same payload area, which Rust's aliasing rules don't allow.
+        // This relies on the server parsing the whole request before it
+        // writes the reply. Removing the overlap needs Reader and Writer
+        // APIs over raw pointers.
+        let (scratch, payload, out_header, body) = unsafe {
+            let header = &*(base as *const FuseUringReqHeader);
+            let scratch = std::slice::from_raw_parts_mut(
+                base.add(header_len + self.payload_cap),
+                IN_HEADER_SIZE + args_len,
+            );
+            scratch[IN_HEADER_SIZE..].copy_from_slice(&header.op_in[..args_len]);
+            (
+                scratch,
+                std::slice::from_raw_parts_mut(base.add(header_len), payload_sz),
+                std::slice::from_raw_parts_mut(base, OUT_HEADER_SIZE),
+                std::slice::from_raw_parts_mut(base.add(header_len), self.payload_cap),
+            )
+        };
+        scratch[..IN_HEADER_SIZE].copy_from_slice(in_header.as_slice());
+
+        let reader = if payload_sz > 0 {
+            Reader::from_uring_buffers(scratch, payload)?
+        } else {
+            Reader::from_fuse_buffer(FuseBuf::new(scratch))?
+        };
+        Ok(Some((
+            in_header.unique,
+            reader,
+            UringWriter::new(out_header, body),
+        )))
+    }
+
+    /// Record the size of the staged reply, `total` bytes including the
+    /// reply header. `unique` names the request in errors.
+    fn finish(&mut self, unique: u64, total: usize) -> Result<()> {
+        // Forget-like requests have no reply.
+        let payload_len = match total {
+            0 => 0,
+            n if (OUT_HEADER_SIZE..=OUT_HEADER_SIZE + self.payload_cap).contains(&n) => {
+                n - OUT_HEADER_SIZE
+            }
+            n => {
+                return Err(SessionFailure(format!(
+                    "uring: malformed reply of {n} bytes for unique 0x{unique:x}"
+                )))
+            }
+        };
+        self.header_mut().ring_ent_in_out.payload_sz = payload_len as u32;
+        Ok(())
     }
 }
 
@@ -672,7 +771,8 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
             let mut sq = ring.submission();
             for (idx, entry) in entries.iter().enumerate() {
                 let sqe = entry.cmd_sqe(fd, FUSE_IO_URING_CMD_REGISTER, 0, idx as u64);
-                // Safe because entries live for the whole lifetime of the loop.
+                // Safe because release_entries() keeps the entries alive
+                // while the kernel holds them.
                 unsafe { sq.push(&sqe) }
                     .map_err(|e| io::Error::other(format!("submission queue full: {e}")))?;
             }
@@ -685,9 +785,16 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
             Err(e) => Err(io::Error::other(e.to_string())),
         });
         registered?;
+        // The number of entries whose command the kernel hasn't completed.
+        let mut armed = entries.len();
 
-        loop {
-            ring.submit_and_wait(1)?;
+        let result = 'serve: loop {
+            match ring.submit_and_wait(1) {
+                Ok(_) => {}
+                // A signal interrupted the wait, which is no reason to stop.
+                Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+                Err(e) => break 'serve Err(e),
+            }
 
             // Drain the completion queue first so that its borrow is
             // released before entries are processed and commits submitted.
@@ -695,9 +802,7 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
                 .completion()
                 .map(|cqe| (cqe.user_data() as usize, cqe.result()))
                 .collect();
-            if completed.is_empty() {
-                continue;
-            }
+            armed = armed.saturating_sub(completed.len());
 
             for (idx, res) in completed {
                 if idx >= entries.len() {
@@ -707,11 +812,11 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
                 let entry = &mut entries[idx];
                 if res < 0 {
                     if exit.load(Ordering::Relaxed) {
-                        return Ok(());
+                        break 'serve Ok(());
                     }
                     // Registration/commit failures leave the entry in an
                     // undefined state; stop serving rather than guessing.
-                    return Err(io::Error::from_raw_os_error(-res));
+                    break 'serve Err(io::Error::from_raw_os_error(-res));
                 }
 
                 if let Err(e) = self.process(entry) {
@@ -729,7 +834,8 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
                 loop {
                     let pushed = {
                         let mut sq = ring.submission();
-                        // Safe because the entry outlives the ring usage.
+                        // Safe because release_entries() keeps the entries
+                        // alive while the kernel holds them.
                         unsafe { sq.push(&sqe) }.is_ok()
                     };
                     if pushed {
@@ -738,137 +844,76 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
                     // The submission queue can never hold more outstanding
                     // commits than completed entries, so submitting must
                     // eventually make room.
-                    ring.submit()?;
+                    if let Err(e) = ring.submit() {
+                        break 'serve Err(e);
+                    }
                 }
+                // Count the commit once it is queued, because release_entries()
+                // submits anything still queued.
+                armed += 1;
             }
-            ring.submit()?;
-        }
+            if let Err(e) = ring.submit() {
+                break 'serve Err(e);
+            }
+        };
+        release_entries(ring, entries, armed);
+        result
     }
 
-    /// Handle one delivered request: reassemble the header/args in the
-    /// request scratch, dispatch to the server with scatter types that
-    /// reference the entry's payload area directly (zero-copy on the data
-    /// path), and stage the reply straight into the entry areas.
+    /// Serve the request delivered into `entry` and stage its reply there.
     fn process(&self, entry: &mut UringEntry) -> Result<()> {
-        let in_header: InHeader = {
-            let header = entry.header();
-            let mut hdr = InHeader::default();
-            hdr.as_mut_slice()
-                .copy_from_slice(&header.in_out[..IN_HEADER_SIZE]);
-            hdr
-        };
-        // Answer an opcode the table doesn't know with ENOSYS here, rather
-        // than dispatch it without its arguments. The kernel then stops
-        // sending it, as it does with FUSE_STATX.
-        let Some(args_len) = in_args_len(in_header.opcode) else {
-            entry.stage_error_reply(libc::ENOSYS);
+        let Some((unique, reader, writer)) = entry.request()? else {
             return Ok(());
         };
-        let payload_sz = entry.header().ring_ent_in_out.payload_sz as usize;
-        if args_len > FUSE_URING_IN_OUT_HEADER_SZ || payload_sz > entry.payload_cap {
-            return Err(SessionFailure(format!(
-                "uring: malformed request, opcode {} args {} payload {}",
-                in_header.opcode, args_len, payload_sz
-            )));
-        }
-
-        let header_len = std::mem::size_of::<FuseUringReqHeader>();
-        let scratch = FUSE_HEADER_SIZE + entry.payload_cap;
-        let base = entry.mem.as_mut_ptr();
-
-        // Assemble only the small header/args portion in the request scratch
-        // region (40 + args_len bytes). The payload (up to ~128K for large
-        // writes) stays in the entry's payload area and is read directly by
-        // the scatter Reader, eliminating the per-request payload memcpy.
-        //
-        // Safe because the slices below address disjoint regions of the
-        // entry allocation and live for the duration of this function only.
-        unsafe {
-            let header = &*(base as *const FuseUringReqHeader);
-            let req_scratch =
-                std::slice::from_raw_parts_mut(base.add(header_len + entry.payload_cap), scratch);
-            let mut off = 0;
-            req_scratch[off..off + IN_HEADER_SIZE]
-                .copy_from_slice(&header.in_out[..IN_HEADER_SIZE]);
-            off += IN_HEADER_SIZE;
-            req_scratch[off..off + args_len].copy_from_slice(&header.op_in[..args_len]);
-        }
-
-        let total = {
-            // Build a scatter Reader:
-            //   Buffer 1 (header scratch): InHeader + opcode args
-            //   Buffer 2 (entry payload area): request payload — only when
-            //     payload_sz > 0, avoiding a copy of up to ~128K.
-            //
-            // Build a scatter Writer:
-            //   Header slot (entry.in_out): fuse_out_header (16 bytes)
-            //   Body slot (entry payload area): reply body
-            // Both are written in place — no post-copy after handle_message.
-            let header_args_len = IN_HEADER_SIZE + args_len;
-            let header_scratch = unsafe {
-                std::slice::from_raw_parts_mut(
-                    base.add(header_len + entry.payload_cap),
-                    header_args_len,
-                )
-            };
-
-            let reader = if payload_sz > 0 {
-                // SAFETY: The Reader's buffer 2 and the Writer's body below
-                // both cover the entry's payload area (base + header_len).
-                // This is technically overlapping mutable borrows, but is
-                // sound because:
-                //   (1) The Reader is fully consumed during argument parsing
-                //       (before handle_message returns).
-                //   (2) The Writer only writes to the payload area during
-                //       reply construction (after the Reader is consumed).
-                //   (3) Both slices are constructed via raw pointers inside
-                //       unsafe blocks, so the borrow checker doesn't track
-                //       them across the handle_message call.
-                // A future refactor could eliminate this by using raw
-                // pointers in both Reader and Writer APIs.
-                let entry_payload =
-                    unsafe { std::slice::from_raw_parts_mut(base.add(header_len), payload_sz) };
-                Reader::<()>::from_uring_buffers(header_scratch, entry_payload)?
-            } else {
-                Reader::<()>::from_fuse_buffer(FuseBuf::new(header_scratch))?
-            };
-
-            // The reply header goes into entry.in_out[0..OUT_HEADER_SIZE] and
-            // the reply body goes directly into the entry's payload area.
-            // See SAFETY comment above regarding overlap with Reader's buffer 2.
-            let in_out_header = unsafe { std::slice::from_raw_parts_mut(base, OUT_HEADER_SIZE) };
-            let payload_area =
-                unsafe { std::slice::from_raw_parts_mut(base.add(header_len), entry.payload_cap) };
-            let writer = UringWriter::<()>::new(in_out_header, payload_area);
-
-            self.server
-                .handle_message(reader, writer, None, None)
-                .map_err(|e| {
-                    SessionFailure(format!(
-                        "uring: handle message unique 0x{:x}: {}",
-                        in_header.unique, e
-                    ))
-                })?
-        };
-
-        if total > 0 {
-            // The scatter writer already placed the reply directly in the
-            // entry areas; just record the payload size and validate.
-            if total < OUT_HEADER_SIZE || total > OUT_HEADER_SIZE + entry.payload_cap {
-                return Err(SessionFailure(format!(
-                    "uring: malformed reply of {} bytes for unique 0x{:x}",
-                    total, in_header.unique
-                )));
-            }
-            let payload_len = total - OUT_HEADER_SIZE;
-            entry.header_mut().ring_ent_in_out.payload_sz = payload_len as u32;
-        } else {
-            // Forget-like requests carry no reply.
-            entry.header_mut().ring_ent_in_out.payload_sz = 0;
-        }
-
-        Ok(())
+        let total = self
+            .server
+            .handle_message(reader, writer, None, None)
+            .map_err(|e| {
+                SessionFailure(format!("uring: handle message unique 0x{unique:x}: {e}"))
+            })?;
+        entry.finish(unique, total)
     }
+}
+
+/// How long a stopping worker waits for the kernel to give back the ring
+/// entries it still holds.
+const RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Drop `ring` and `entries` once the kernel holds none of the entries.
+///
+/// The kernel may copy a request into an entry until it completes the
+/// entry's command, and closing the ring only cancels the commands later,
+/// from a workqueue. So wait for the `armed` outstanding completions first,
+/// which arrive quickly once the connection is torn down. If they don't
+/// arrive within `RELEASE_TIMEOUT`, leak the entries instead of freeing
+/// memory the kernel may still write to.
+fn release_entries(
+    mut ring: IoUring<squeue::Entry128, cqueue::Entry>,
+    entries: Vec<UringEntry>,
+    mut armed: usize,
+) {
+    let deadline = Instant::now() + RELEASE_TIMEOUT;
+    while armed > 0 {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        let ts = types::Timespec::new()
+            .sec(left.as_secs())
+            .nsec(left.subsec_nanos());
+        let args = types::SubmitArgs::new().timespec(&ts);
+        match ring.submitter().submit_with_args(1, &args) {
+            Ok(_) => {}
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ETIME | libc::EINTR)) => {}
+            Err(_) => break,
+        }
+        armed = armed.saturating_sub(ring.completion().count());
+    }
+    if armed > 0 {
+        warn!("uring worker: leaking {armed} ring entries that the kernel still holds");
+        std::mem::forget(entries);
+    }
+    drop(ring);
 }
 
 /// Serve FUSE requests over io_uring (experimental).
@@ -1200,7 +1245,7 @@ mod tests {
         assert_eq!(entry.qid, 3);
 
         let header_len = std::mem::size_of::<FuseUringReqHeader>();
-        let total = header_len + payload_cap + 2 * (FUSE_HEADER_SIZE + payload_cap);
+        let total = header_len + payload_cap + REQ_SCRATCH_SIZE;
         assert_eq!(entry.mem.len(), total);
 
         // The iovec array must describe the header and payload areas of the
@@ -1399,6 +1444,62 @@ mod tests {
         assert_eq!(&hdr[..], &[0xFF; OUT_HEADER_SIZE]);
         assert_eq!(&body[..3], &[0xFF, 1, 2]);
         assert_eq!(&body[3..19], &(8..24).collect::<Vec<u8>>()[..]);
+    }
+
+    /// Mount a PassthroughFs over `src` at `mnt` and serve it over
+    /// io_uring, or return None if the kernel rejects FUSE-over-io_uring.
+    fn mount_uring(
+        src: &std::path::Path,
+        mnt: &std::path::Path,
+    ) -> Option<UringFuseServing<PassthroughFs<()>>> {
+        let fs = PassthroughFs::<()>::new(Config {
+            root_dir: src.to_string_lossy().to_string(),
+            do_import: false,
+            ..Default::default()
+        })
+        .unwrap();
+        fs.import().unwrap();
+        let server = Arc::new(Server::new(fs));
+        server.set_uring(true);
+
+        let mut se = FuseSession::new(mnt, "uring_serving_test", "", false).unwrap();
+        se.mount().unwrap();
+        let cfg = UringConfig {
+            workers: 2,
+            entries_per_queue: 2,
+        };
+        match UringFuseServing::new(se, server, cfg) {
+            Ok(serving) => Some(serving),
+            Err(UringNotSupported) => None,
+            Err(e) => panic!("uring serving failed: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_uring_serving_mount() {
+        let src = TempDir::new().unwrap();
+        std::fs::write(src.as_path().join("hello"), b"over io_uring").unwrap();
+        let mnt = TempDir::new().unwrap();
+        let Some(serving) = mount_uring(src.as_path(), mnt.as_path()) else {
+            eprintln!("FUSE-over-io_uring is not available, skipping");
+            return;
+        };
+
+        assert_eq!(
+            std::fs::read(mnt.as_path().join("hello")).unwrap(),
+            b"over io_uring"
+        );
+        let created = mnt.as_path().join("created");
+        std::fs::write(&created, b"written over io_uring").unwrap();
+        assert_eq!(std::fs::read(&created).unwrap(), b"written over io_uring");
+
+        // Dropping the serving layer tears the connection down, and the
+        // workers get their entries back from the kernel well within
+        // RELEASE_TIMEOUT instead of waiting it out.
+        let start = Instant::now();
+        drop(serving);
+        assert!(start.elapsed() < RELEASE_TIMEOUT);
+        assert!(std::fs::read(mnt.as_path().join("hello")).is_err());
     }
 
     /// A worker over PassthroughFs, for exercising process() without a
