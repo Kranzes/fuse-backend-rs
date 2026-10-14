@@ -37,6 +37,8 @@
   sets in requests it sends again after `notify_resend()`.
 - `RuntimeType::file_io_blocks()` tells whether async file IO on a runtime type blocks the
   calling thread, as it does on tokio.
+- `AsyncFileSystem` methods default to calling their `FileSystem` counterparts, so a
+  file system only implements the handlers it serves asynchronously.
 
 ### Changed
 - With the tokio runtime, `FuseDevTask` no longer retries reads in a loop. It waits for requests
