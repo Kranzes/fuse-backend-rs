@@ -60,6 +60,9 @@
   sets in requests it sends again after `notify_resend()`.
 - `UringWriter` implements the asynchronous `Writer` methods, so the async server can reply
   through the FUSE-over-io_uring transport.
+- `UringFuseServing::new_async()` serves FUSE-over-io_uring with the `AsyncFileSystem` handlers.
+  Each worker runs an async runtime and keeps up to one request per ring entry in flight, so
+  handlers that wait don't hold up the worker's other requests.
 
 ### Changed
 - The FUSE-over-io_uring transport answers opcodes it doesn't know with ENOSYS instead of EIO.

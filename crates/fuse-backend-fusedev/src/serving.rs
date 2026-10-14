@@ -14,6 +14,7 @@
 //! | [`SyncFuseServing`]  | `F: FileSystem`      | classic `/dev/fuse`  |
 //! | `AsyncFuseServing`   | `F: AsyncFileSystem` | classic `/dev/fuse`  |
 //! | `UringFuseServing`   | `F: FileSystem`      | FUSE-over-io_uring   |
+//! | (`new_async()`)      | `F: AsyncFileSystem` | FUSE-over-io_uring   |
 //!
 //! The axes a serving layer owns are the *transport* and the *handler
 //! model* — both fixed at the type level — plus the *worker count*, a
@@ -48,8 +49,9 @@
 //!   (`AsyncFileSystem`) decouple the request concurrency from the
 //!   worker count.
 //!
-//! `AsyncFuseServing` needs the `async-io` feature and `UringFuseServing`
-//! the `uring` feature; [`SyncFuseServing`] is always available.
+//! `AsyncFuseServing` needs the `async-io` feature, `UringFuseServing` the
+//! `uring` feature, and `UringFuseServing::new_async()` both;
+//! [`SyncFuseServing`] is always available.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};

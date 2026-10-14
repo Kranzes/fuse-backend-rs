@@ -50,6 +50,7 @@ async-io = [
     "tokio/rt",
     "tokio/macros",
     "tokio/net",
+    "tokio/time",
     "fuse-backend-core/async-io",
     # The session tests mount a real `PassthroughFs`, and core's
     # `BackendFileSystem` requires `AsyncFileSystem` once core's `async-io`

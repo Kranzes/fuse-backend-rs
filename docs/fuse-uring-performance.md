@@ -255,7 +255,11 @@ and uses the buffer pools of protocol 7.46 (kernel 7.3) when the kernel has them
 
 - `bufs_per_queue`: Default is 4. On Linux 7.3 and later it caps the
   requests with a payload or reply body that one queue serves at once, and
-  with it the memory of the payload buffers.
+  with it the memory of the payload buffers. With `new_async()`, a request
+  keeps its buffer while its handler waits, so give each queue as many
+  buffers as entries. With 16 entries and 4 buffers per queue, 4 KiB
+  random writes with the async handlers reached 0.82M IOPS, against 1.05M
+  with a buffer per entry. The synchronous handlers showed no difference.
 
 - Thread count: The per-CPU queue model means optimal performance when
   worker threads match available CPU cores.
