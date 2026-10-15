@@ -1861,7 +1861,8 @@ mod tests {
                 umask: 0,
                 fuse_flags: 0,
             };
-            let (entry, handle, _opts) = fs.async_create(&ctx, ROOT_ID, &name, args).await.unwrap();
+            let (entry, handle, _opts, _) =
+                fs.async_create(&ctx, ROOT_ID, &name, args).await.unwrap();
             let handle = handle.unwrap();
 
             for (i, block) in payload.chunks(BLOCK).enumerate() {
