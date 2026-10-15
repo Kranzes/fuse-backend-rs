@@ -10,8 +10,14 @@
 //! the daemon in the SQE command payload.
 //!
 //! The kernel still uses the classic /dev/fuse path for requests it cannot
-//! route through io_uring (FUSE_INTERRUPT and requests queued before entries
-//! were registered), so a classic channel thread keeps serving in parallel.
+//! route through io_uring (FUSE_FORGET, FUSE_INTERRUPT and requests queued
+//! before entries were registered), so a classic channel thread keeps serving
+//! in parallel.
+//!
+//! `UringFuseServing::new()` serves the rings with the synchronous handlers,
+//! one request at a time per worker. `UringFuseServing::new_async()` serves
+//! them with the asynchronous handlers, up to one request per ring entry at
+//! a time per worker.
 //!
 //! Experimental: the kernel interface is still evolving; only the minimal 7.42
 //! interface is implemented.
@@ -19,18 +25,19 @@
 use std::fs::File;
 use std::io::{self, IoSlice, Write};
 use std::mem::ManuallyDrop;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use vm_memory::ByteValued;
 
 use fuse_backend_core::abi::fuse_abi::{InHeader, OutHeader};
 use fuse_backend_core::abi::fuse_uring::{
-    FuseUringCmdReq, FuseUringEntInOut, FuseUringReqHeader, FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
+    FuseUringCmdReq, FuseUringReqHeader, FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
     FUSE_IO_URING_CMD_REGISTER, FUSE_URING_IN_OUT_HEADER_SZ, FUSE_URING_IOV_SEGS,
 };
 use fuse_backend_core::api::filesystem::FileSystem;
@@ -38,9 +45,23 @@ use fuse_backend_core::api::server::Server;
 use fuse_backend_core::buffer::{Error::*, Reader, Result, Writer};
 use fuse_backend_core::file_buf::FileVolatileSlice;
 use fuse_backend_core::file_traits::FileReadWriteVolatile;
+#[cfg(feature = "async-io")]
+use fuse_backend_core::{
+    api::filesystem::AsyncFileSystem, async_runtime::Runtime, file_buf::FileVolatileBuf,
+    file_traits::AsyncFileReadWriteVolatile,
+};
+#[cfg(feature = "async-io")]
+use futures_util::{
+    stream::{FuturesUnordered, StreamExt},
+    FutureExt,
+};
+#[cfg(feature = "async-io")]
+use tokio::io::{unix::AsyncFd, Interest};
 use vm_memory::bitmap::BitmapSlice;
 
 use crate::serving::{FuseServing, WorkerSet};
+#[cfg(feature = "async-io")]
+use crate::FuseDevTask;
 use crate::{FuseBuf, FuseChannel, FuseDevReaderExt, FuseSession, FUSE_HEADER_SIZE};
 
 /// Size of `fuse_in_header`/`fuse_out_header` on the wire.
@@ -199,7 +220,7 @@ fn in_args_len(opcode: u32) -> Option<usize> {
         47 => 56,      // COPY_FILE_RANGE: CopyFileRangeIn
         // SETUPMAPPING/REMOVEMAPPING only exist on the virtiofs DAX window
         // path and are never delivered through /dev/fuse, opcodes 0, 7 and
-        // 19 are undefined, and process() answers the rest, such as
+        // 19 are undefined, and request() answers the rest, such as
         // SYNCFS, TMPFILE and STATX, with ENOSYS.
         _ => return None,
     };
@@ -351,18 +372,7 @@ impl<'a, S: BitmapSlice> UringWriter<'a, S> {
     }
 
     fn check_available_space(&self, sz: usize) -> io::Result<()> {
-        if sz > self.available_bytes() {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "data out of range, available {} requested {}",
-                    self.available_bytes(),
-                    sz,
-                ),
-            ))
-        } else {
-            Ok(())
-        }
+        check_fits(self.available_bytes(), sz)
     }
 
     /// Write data, routing the first `OUT_HEADER_SIZE` bytes to the header
@@ -380,6 +390,25 @@ impl<'a, S: BitmapSlice> UringWriter<'a, S> {
         Ok(data.len())
     }
 
+    /// The unwritten end of the body region, after checking that `count`
+    /// more bytes fit into it. Free space in the header slot doesn't count,
+    /// because file data only goes into the body.
+    fn body_tail(&mut self, count: usize) -> io::Result<*mut u8> {
+        check_fits(self.body.capacity() - self.body.len(), count)?;
+        // Safe because the body's length never exceeds its capacity.
+        Ok(unsafe { self.body.as_mut_ptr().add(self.body.len()) })
+    }
+
+    /// Account `cnt` bytes that a file read placed at `body_tail()`.
+    ///
+    /// # Safety
+    /// The bytes must have been written at the pointer `body_tail(count)`
+    /// returned, with `cnt <= count`.
+    unsafe fn advance_body(&mut self, cnt: usize) {
+        let new_len = self.body.len() + cnt;
+        self.body.set_len(new_len);
+    }
+
     /// Stage data read from a file descriptor at offset `off` into the body
     /// region. Must be called after the header has been fully written.
     pub fn write_from_at<F: FileReadWriteVolatile>(
@@ -388,22 +417,48 @@ impl<'a, S: BitmapSlice> UringWriter<'a, S> {
         count: usize,
         off: u64,
     ) -> io::Result<usize> {
-        self.check_available_space(count)?;
-        let cnt = src.read_vectored_at_volatile(
-            // Safe because check_available_space() ensures capacity.
-            unsafe {
-                &[FileVolatileSlice::from_raw_ptr(
-                    self.body.as_mut_ptr().add(self.body.len()),
-                    count,
-                )]
-            },
-            off,
-        )?;
-        let new_len = self.body.len() + cnt;
-        // Safe because cnt <= count was checked above.
-        unsafe { self.body.set_len(new_len) };
+        let tail = self.body_tail(count)?;
+        // Safe because body_tail() checked that count bytes fit.
+        let cnt = src
+            .read_vectored_at_volatile(
+                unsafe { &[FileVolatileSlice::from_raw_ptr(tail, count)] },
+                off,
+            )?
+            .min(count);
+        // Safe because the read placed cnt <= count bytes at the tail.
+        unsafe { self.advance_body(cnt) };
         Ok(cnt)
     }
+
+    /// Stage data read asynchronously from a file at offset `off` into the
+    /// body region, like `write_from_at()`.
+    #[cfg(feature = "async-io")]
+    pub async fn async_write_from_at<F: AsyncFileReadWriteVolatile>(
+        &mut self,
+        src: &F,
+        count: usize,
+        off: u64,
+    ) -> io::Result<usize> {
+        let tail = self.body_tail(count)?;
+        // Safe because body_tail() checked that count bytes fit, and the
+        // writer borrows the body region for 'a, which outlives the read.
+        let buf = unsafe { FileVolatileBuf::from_raw_ptr(tail, 0, count) };
+        let (res, _) = src.async_read_at_volatile(buf, off).await;
+        let cnt = res?.min(count);
+        // Safe because the read placed cnt <= count bytes at the tail.
+        unsafe { self.advance_body(cnt) };
+        Ok(cnt)
+    }
+}
+
+fn check_fits(available: usize, requested: usize) -> io::Result<()> {
+    if requested > available {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("data out of range, available {available} requested {requested}"),
+        ));
+    }
+    Ok(())
 }
 
 impl<S: BitmapSlice> Write for UringWriter<'_, S> {
@@ -429,13 +484,14 @@ impl<S: BitmapSlice> Write for UringWriter<'_, S> {
     }
 }
 
+#[cfg_attr(feature = "async-io", async_trait::async_trait(?Send))]
 impl<'a, S: BitmapSlice> Writer for UringWriter<'a, S> {
-    // All methods forward to the inherent methods of the same name; the
-    // explicit `UringWriter::` prefix keeps the forwarding unambiguous and
-    // makes removing an inherent method a compile error instead of silent
-    // infinite recursion. The uring transport has no async-io support and
-    // relies on the trait's default `EINVAL` implementations for the
-    // `async_*` methods.
+    // The synchronous methods and `async_write_from_at` forward to the
+    // inherent methods of the same name; the explicit `UringWriter::`
+    // prefix keeps the forwarding unambiguous and makes removing an
+    // inherent method a compile error instead of silent infinite
+    // recursion. The writer only stages the reply in memory, so the other
+    // `async_*` methods run the `io::Write` methods and `commit()`.
     fn write_from_at<F: FileReadWriteVolatile>(
         &mut self,
         src: F,
@@ -460,18 +516,61 @@ impl<'a, S: BitmapSlice> Writer for UringWriter<'a, S> {
     fn commit(&mut self, other: Option<&Self>) -> io::Result<usize> {
         UringWriter::commit(self, other)
     }
+
+    #[cfg(feature = "async-io")]
+    async fn async_write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.write(data)
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_write2(&mut self, data: &[u8], data2: &[u8]) -> io::Result<usize> {
+        self.write_vectored(&[IoSlice::new(data), IoSlice::new(data2)])
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_write3(&mut self, data: &[u8], data2: &[u8], data3: &[u8]) -> io::Result<usize> {
+        self.write_vectored(&[IoSlice::new(data), IoSlice::new(data2), IoSlice::new(data3)])
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.write_all(buf)
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_write_from_at<F: AsyncFileReadWriteVolatile>(
+        &mut self,
+        src: &F,
+        count: usize,
+        off: u64,
+    ) -> io::Result<usize> {
+        UringWriter::async_write_from_at(self, src, count, off).await
+    }
+
+    #[cfg(feature = "async-io")]
+    async fn async_commit(&mut self, other: Option<&Self>) -> io::Result<usize> {
+        UringWriter::commit(self, other)
+    }
 }
 
 // Both buffers are owned by the caller (ring entry areas);
 // UringWriter holds ManuallyDrop Vec shells, so dropping
 // the writer never frees the memory.
 
-/// One ring entry: the memory areas the kernel reads/writes plus scratch
-/// regions used to reassemble requests and collect replies.
+/// Size of an entry's request scratch: the in header plus the largest fixed
+/// arguments a request can carry in `op_in`.
+const REQ_SCRATCH_SIZE: usize = IN_HEADER_SIZE + FUSE_URING_IN_OUT_HEADER_SZ;
+
+/// A delivered request: its unique id, and the Reader and UringWriter over
+/// the entry that holds it.
+type Request<'a> = (u64, Reader<'a, ()>, UringWriter<'a, ()>);
+
+/// One ring entry: the memory areas the kernel reads/writes plus a scratch
+/// region used to reassemble the request header and fixed arguments.
 struct UringEntry {
     qid: u16,
     /// Single allocation, laid out as
-    /// [FuseUringReqHeader][payload][request scratch][reply scratch].
+    /// [FuseUringReqHeader][payload][request scratch of REQ_SCRATCH_SIZE].
     mem: Box<[u8]>,
     payload_cap: usize,
     /// iovec array referenced by the SQEs, must stay at a stable address.
@@ -480,8 +579,7 @@ struct UringEntry {
 
 impl UringEntry {
     fn new(qid: u16, payload_cap: usize) -> UringEntry {
-        let scratch = FUSE_HEADER_SIZE + payload_cap;
-        let total = std::mem::size_of::<FuseUringReqHeader>() + payload_cap + 2 * scratch;
+        let total = std::mem::size_of::<FuseUringReqHeader>() + payload_cap + REQ_SCRATCH_SIZE;
         let mem = vec![0u8; total].into_boxed_slice();
         let base = mem.as_ptr();
         let iovecs = Box::new([
@@ -551,24 +649,134 @@ impl UringEntry {
         sqe.user_data(user_data)
     }
 
+    /// The header of the request the kernel delivered into this entry.
+    fn in_header(&self) -> InHeader {
+        let mut hdr = InHeader::default();
+        hdr.as_mut_slice()
+            .copy_from_slice(&self.header().in_out[..IN_HEADER_SIZE]);
+        hdr
+    }
+
     /// Stage a `-errno` error reply, so that the subsequent
     /// `COMMIT_AND_FETCH` hands the client a proper error instead of the
     /// request data still sitting in the entry areas.
     fn stage_error_reply(&mut self, errno: i32) {
-        let header = self.header_mut();
-        let mut in_hdr = InHeader::default();
-        in_hdr
-            .as_mut_slice()
-            .copy_from_slice(&header.in_out[..IN_HEADER_SIZE]);
+        // A partial reply may have overwritten the in header by now, but the
+        // out header keeps `unique` at the same offset.
         let out = OutHeader {
             len: OUT_HEADER_SIZE as u32,
             error: -errno,
-            unique: in_hdr.unique,
+            unique: self.in_header().unique,
         };
+        let header = self.header_mut();
         header.in_out[..OUT_HEADER_SIZE].copy_from_slice(out.as_slice());
         header.ring_ent_in_out.payload_sz = 0;
     }
+
+    /// Check the request the kernel delivered into this entry, and build
+    /// the Reader over it and the UringWriter for its reply.
+    ///
+    /// This copies the fixed arguments behind the in header into the
+    /// request scratch. The payload, up to `payload_cap` bytes, stays in the
+    /// payload area, and the Reader reads it there. The writer puts the
+    /// reply header into the `in_out` slot and the reply body into the
+    /// payload area, so nothing is copied afterwards. Both borrow the entry
+    /// until the request has been handled. Returns the request's unique id
+    /// with them, or `None` if the entry already holds the reply.
+    fn request(&mut self) -> Result<Option<Request<'_>>> {
+        let in_header = self.in_header();
+        // Answer an opcode the table doesn't know with ENOSYS here, rather
+        // than dispatch it without its arguments. The kernel then stops
+        // sending it, as it does with FUSE_STATX.
+        let Some(args_len) = in_args_len(in_header.opcode) else {
+            self.stage_error_reply(libc::ENOSYS);
+            return Ok(None);
+        };
+        let payload_sz = self.header().ring_ent_in_out.payload_sz as usize;
+        if args_len > FUSE_URING_IN_OUT_HEADER_SZ || payload_sz > self.payload_cap {
+            return Err(SessionFailure(format!(
+                "uring: malformed request, opcode {} args {} payload {}",
+                in_header.opcode, args_len, payload_sz
+            )));
+        }
+
+        let header_len = std::mem::size_of::<FuseUringReqHeader>();
+        let base = self.mem.as_mut_ptr();
+        // Safe because the entry allocation holds the request header, then
+        // the payload area, then the request scratch, which fits the in
+        // header plus the largest fixed arguments checked above.
+        //
+        // The Reader's payload and the Writer's body are mutable slices over
+        // the same payload area, which Rust's aliasing rules don't allow.
+        // This relies on the server parsing the whole request before it
+        // writes the reply. Removing the overlap needs Reader and Writer
+        // APIs over raw pointers.
+        let (scratch, payload, out_header, body) = unsafe {
+            let header = &*(base as *const FuseUringReqHeader);
+            let scratch = std::slice::from_raw_parts_mut(
+                base.add(header_len + self.payload_cap),
+                IN_HEADER_SIZE + args_len,
+            );
+            scratch[IN_HEADER_SIZE..].copy_from_slice(&header.op_in[..args_len]);
+            (
+                scratch,
+                std::slice::from_raw_parts_mut(base.add(header_len), payload_sz),
+                std::slice::from_raw_parts_mut(base, OUT_HEADER_SIZE),
+                std::slice::from_raw_parts_mut(base.add(header_len), self.payload_cap),
+            )
+        };
+        scratch[..IN_HEADER_SIZE].copy_from_slice(in_header.as_slice());
+
+        let reader = if payload_sz > 0 {
+            Reader::from_uring_buffers(scratch, payload)?
+        } else {
+            Reader::from_fuse_buffer(FuseBuf::new(scratch))?
+        };
+        Ok(Some((
+            in_header.unique,
+            reader,
+            UringWriter::new(out_header, body),
+        )))
+    }
+
+    /// Record the size of the staged reply, `total` bytes including the
+    /// reply header. `unique` names the request in errors.
+    fn finish(&mut self, unique: u64, total: usize) -> Result<()> {
+        // Forget-like requests have no reply.
+        let payload_len = match total {
+            0 => 0,
+            n if (OUT_HEADER_SIZE..=OUT_HEADER_SIZE + self.payload_cap).contains(&n) => {
+                n - OUT_HEADER_SIZE
+            }
+            n => {
+                return Err(SessionFailure(format!(
+                    "uring: malformed reply of {n} bytes for unique 0x{unique:x}"
+                )))
+            }
+        };
+        self.header_mut().ring_ent_in_out.payload_sz = payload_len as u32;
+        Ok(())
+    }
 }
+
+/// A FUSE ring. `IORING_OP_URING_CMD` with the FUSE command payload needs
+/// 128-byte SQEs.
+type FuseRing = IoUring<squeue::Entry128, cqueue::Entry>;
+
+/// The function a worker thread runs: `UringWorker::run()`, or
+/// `UringWorker::run_async()` for asynchronous handlers.
+type RunFn<F> = fn(UringWorker<F>, Arc<AtomicBool>, Sender<io::Result<()>>) -> io::Result<()>;
+
+/// Prepare the body of the thread that serves the requests the kernel sends
+/// through `/dev/fuse`: `UringFuseServing::fallback_sync()`, or
+/// `UringFuseServing::fallback_async()` for asynchronous handlers. The body
+/// sends on the `Sender` once it serves, and exits without sending if it
+/// can't.
+type FallbackFn<F> = fn(
+    &mut FuseSession,
+    Arc<Server<F>>,
+    Arc<AtomicBool>,
+) -> Result<Box<dyn FnOnce(Sender<()>) + Send>>;
 
 /// One io_uring based serving thread, holding ring entries of several
 /// kernel queues.
@@ -581,222 +789,359 @@ struct UringWorker<F: FileSystem + Send + Sync + 'static> {
 }
 
 impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
-    fn run(self, exit: Arc<AtomicBool>, ready_tx: Sender<io::Result<()>>) -> io::Result<()> {
+    /// Create the worker's ring and entries and register the entries,
+    /// reporting the outcome through `ready_tx`. The kernel holds all
+    /// entries afterwards. `prepare` runs on the new ring before the
+    /// registration, and its failure fails the setup.
+    fn setup<T>(
+        &self,
+        ready_tx: &Sender<io::Result<()>>,
+        prepare: impl FnOnce(&FuseRing) -> io::Result<T>,
+    ) -> io::Result<(FuseRing, Vec<UringEntry>, T)> {
+        let registered = self.register(prepare);
+        let _ = ready_tx.send(match &registered {
+            Ok(_) => Ok(()),
+            Err(e) => Err(io::Error::other(e.to_string())),
+        });
+        registered
+    }
+
+    fn register<T>(
+        &self,
+        prepare: impl FnOnce(&FuseRing) -> io::Result<T>,
+    ) -> io::Result<(FuseRing, Vec<UringEntry>, T)> {
         let total_entries = self.entry_qids.len();
-        let mut ring: IoUring<squeue::Entry128, cqueue::Entry> =
-            IoUring::<squeue::Entry128, cqueue::Entry>::generic_builder()
-                .build((total_entries * 2) as u32)?;
+        let mut ring = FuseRing::generic_builder().build((total_entries * 2) as u32)?;
+        let prepared = prepare(&ring)?;
         let fd = self.fd.as_raw_fd();
 
-        let mut entries: Vec<UringEntry> = self
+        let entries: Vec<UringEntry> = self
             .entry_qids
             .iter()
             .map(|&qid| UringEntry::new(qid, self.payload_cap))
             .collect();
 
-        // Register all entries; the CQE of each REGISTER SQE returns once a
-        // request has been assigned to the entry.
-        let registered = (|| {
+        // The CQE of each REGISTER SQE returns once a request has been
+        // assigned to the entry.
+        {
             let mut sq = ring.submission();
             for (idx, entry) in entries.iter().enumerate() {
                 let sqe = entry.cmd_sqe(fd, FUSE_IO_URING_CMD_REGISTER, 0, idx as u64);
-                // Safe because entries live for the whole lifetime of the loop.
+                // Safe because release_entries() keeps the entries alive
+                // while the kernel holds them.
                 unsafe { sq.push(&sqe) }
                     .map_err(|e| io::Error::other(format!("submission queue full: {e}")))?;
             }
-            drop(sq);
-            ring.submit()
-        })()
-        .map(|_| ());
-        let _ = ready_tx.send(match &registered {
-            Ok(()) => Ok(()),
-            Err(e) => Err(io::Error::other(e.to_string())),
-        });
-        registered?;
+        }
+        ring.submit()?;
+        Ok((ring, entries, prepared))
+    }
 
-        loop {
-            ring.submit_and_wait(1)?;
+    fn run(self, exit: Arc<AtomicBool>, ready_tx: Sender<io::Result<()>>) -> io::Result<()> {
+        let (mut ring, mut entries, ()) = self.setup(&ready_tx, |_| Ok(()))?;
+        let fd = self.fd.as_raw_fd();
+        // The number of entries whose command the kernel hasn't completed.
+        let mut armed = entries.len();
 
-            // Drain the completion queue first so that its borrow is
-            // released before entries are processed and commits submitted.
-            let completed: Vec<(usize, i32)> = ring
-                .completion()
-                .map(|cqe| (cqe.user_data() as usize, cqe.result()))
-                .collect();
-            if completed.is_empty() {
-                continue;
+        let result = 'serve: loop {
+            match ring.submit_and_wait(1) {
+                Ok(_) => {}
+                // A signal interrupted the wait, which is no reason to stop.
+                Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+                Err(e) => break 'serve Err(e),
             }
 
+            let completed = drain_completions(&mut ring);
+            armed = armed.saturating_sub(completed.len());
             for (idx, res) in completed {
-                if idx >= entries.len() {
+                let Some(entry) = entries.get_mut(idx) else {
                     warn!("uring worker: CQE with unexpected user_data {}", idx);
                     continue;
-                }
-                let entry = &mut entries[idx];
+                };
                 if res < 0 {
-                    if exit.load(Ordering::Relaxed) {
-                        return Ok(());
-                    }
-                    // Registration/commit failures leave the entry in an
-                    // undefined state; stop serving rather than guessing.
-                    return Err(io::Error::from_raw_os_error(-res));
+                    break 'serve stop_result(&exit, res);
                 }
-
                 if let Err(e) = self.process(entry) {
                     warn!("uring worker: failed to handle request: {e}");
                     entry.stage_error_reply(libc::EIO);
                 }
-
-                let ent: FuseUringEntInOut = entry.header().ring_ent_in_out;
-                let sqe = entry.cmd_sqe(
-                    fd,
-                    FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
-                    ent.commit_id,
-                    idx as u64,
-                );
-                loop {
-                    let pushed = {
-                        let mut sq = ring.submission();
-                        // Safe because the entry outlives the ring usage.
-                        unsafe { sq.push(&sqe) }.is_ok()
-                    };
-                    if pushed {
-                        break;
-                    }
-                    // The submission queue can never hold more outstanding
-                    // commits than completed entries, so submitting must
-                    // eventually make room.
-                    ring.submit()?;
+                if let Err(e) = push_commit(&mut ring, fd, entry, idx) {
+                    break 'serve Err(e);
                 }
+                // Count the commit once it is queued, because release_entries()
+                // submits anything still queued.
+                armed += 1;
             }
-            ring.submit()?;
-        }
+            if let Err(e) = ring.submit() {
+                break 'serve Err(e);
+            }
+        };
+        release_entries(ring, entries, armed);
+        result
     }
 
-    /// Handle one delivered request: reassemble the header/args in the
-    /// request scratch, dispatch to the server with scatter types that
-    /// reference the entry's payload area directly (zero-copy on the data
-    /// path), and stage the reply straight into the entry areas.
+    /// Serve the request delivered into `entry` and stage its reply there.
     fn process(&self, entry: &mut UringEntry) -> Result<()> {
-        let in_header: InHeader = {
-            let header = entry.header();
-            let mut hdr = InHeader::default();
-            hdr.as_mut_slice()
-                .copy_from_slice(&header.in_out[..IN_HEADER_SIZE]);
-            hdr
-        };
-        // Answer an opcode the table doesn't know with ENOSYS here, rather
-        // than dispatch it without its arguments. The kernel then stops
-        // sending it, as it does with FUSE_STATX.
-        let Some(args_len) = in_args_len(in_header.opcode) else {
-            entry.stage_error_reply(libc::ENOSYS);
+        let Some((unique, reader, writer)) = entry.request()? else {
             return Ok(());
         };
-        let payload_sz = entry.header().ring_ent_in_out.payload_sz as usize;
-        if args_len > FUSE_URING_IN_OUT_HEADER_SZ || payload_sz > entry.payload_cap {
-            return Err(SessionFailure(format!(
-                "uring: malformed request, opcode {} args {} payload {}",
-                in_header.opcode, args_len, payload_sz
-            )));
-        }
+        let total = self
+            .server
+            .handle_message(reader, writer, None, None)
+            .map_err(|e| {
+                SessionFailure(format!("uring: handle message unique 0x{unique:x}: {e}"))
+            })?;
+        entry.finish(unique, total)
+    }
+}
 
-        let header_len = std::mem::size_of::<FuseUringReqHeader>();
-        let scratch = FUSE_HEADER_SIZE + entry.payload_cap;
-        let base = entry.mem.as_mut_ptr();
+#[cfg(feature = "async-io")]
+impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
+    /// Serve requests with the asynchronous handlers, each in its own
+    /// future, on an async runtime of this thread.
+    fn run_async(self, exit: Arc<AtomicBool>, ready_tx: Sender<io::Result<()>>) -> io::Result<()> {
+        // Create the runtime before the registration, so a failure can't
+        // free entries the kernel holds. Runtime::new() panics on failure.
+        // That has to become an error here, because the other workers keep
+        // the ready channel open and the constructor would never see this
+        // thread exit.
+        let Ok(runtime) = std::panic::catch_unwind(Runtime::new) else {
+            let e = || io::Error::other("failed to create the async runtime");
+            let _ = ready_tx.send(Err(e()));
+            return Err(e());
+        };
+        // Register the ring fd with the runtime before reporting the worker
+        // ready, so a failure fails the constructor instead of leaving the
+        // worker's entries unserved.
+        let (mut ring, entries, ring_ready) = self.setup(&ready_tx, |ring| {
+            // Safe because the AsyncFd is dropped in serve_async(), before
+            // release_entries() closes the ring.
+            runtime
+                .block_on(async {
+                    unsafe { AsyncFd::register_with_interest(ring.as_raw_fd(), Interest::READABLE) }
+                })
+                .map_err(io::Error::from)
+        })?;
+        let mut armed = entries.len();
+        let mut entries: Vec<Option<UringEntry>> = entries.into_iter().map(Some).collect();
+        let result = runtime.block_on(self.serve_async(
+            &mut ring,
+            ring_ready,
+            &mut entries,
+            &mut armed,
+            &exit,
+        ));
+        release_entries(ring, entries.into_iter().flatten().collect(), armed);
+        result
+    }
 
-        // Assemble only the small header/args portion in the request scratch
-        // region (40 + args_len bytes). The payload (up to ~128K for large
-        // writes) stays in the entry's payload area and is read directly by
-        // the scatter Reader, eliminating the per-request payload memcpy.
-        //
-        // Safe because the slices below address disjoint regions of the
-        // entry allocation and live for the duration of this function only.
-        unsafe {
-            let header = &*(base as *const FuseUringReqHeader);
-            let req_scratch =
-                std::slice::from_raw_parts_mut(base.add(header_len + entry.payload_cap), scratch);
-            let mut off = 0;
-            req_scratch[off..off + IN_HEADER_SIZE]
-                .copy_from_slice(&header.in_out[..IN_HEADER_SIZE]);
-            off += IN_HEADER_SIZE;
-            req_scratch[off..off + args_len].copy_from_slice(&header.op_in[..args_len]);
-        }
+    /// The loop of `run_async()`. A delivered request moves its entry into
+    /// a request future, which hands it back with the reply staged. So the
+    /// kernel and a handler never use an entry at the same time, and a
+    /// waiting handler doesn't hold up the requests in other entries.
+    ///
+    /// The ring fd is readable while completions are queued, so the loop
+    /// sleeps in the runtime until a completion or a request future is
+    /// ready. It commits all requests that are done by then and submits
+    /// the commits in one `io_uring_enter()`.
+    ///
+    /// Tearing the connection down fails the commands of the armed entries,
+    /// which stops the loop. While no entry is armed, no command can fail,
+    /// so the loop checks `exit` every `EXIT_POLL` instead.
+    async fn serve_async(
+        &self,
+        ring: &mut FuseRing,
+        ring_ready: AsyncFd<RawFd>,
+        entries: &mut [Option<UringEntry>],
+        armed: &mut usize,
+        exit: &AtomicBool,
+    ) -> io::Result<()> {
+        let fd = self.fd.as_raw_fd();
+        let server = &*self.server;
+        let mut inflight = FuturesUnordered::new();
 
-        let total = {
-            // Build a scatter Reader:
-            //   Buffer 1 (header scratch): InHeader + opcode args
-            //   Buffer 2 (entry payload area): request payload — only when
-            //     payload_sz > 0, avoiding a copy of up to ~128K.
-            //
-            // Build a scatter Writer:
-            //   Header slot (entry.in_out): fuse_out_header (16 bytes)
-            //   Body slot (entry payload area): reply body
-            // Both are written in place — no post-copy after handle_message.
-            let header_args_len = IN_HEADER_SIZE + args_len;
-            let header_scratch = unsafe {
-                std::slice::from_raw_parts_mut(
-                    base.add(header_len + entry.payload_cap),
-                    header_args_len,
-                )
-            };
+        let result = 'serve: loop {
+            let completed = drain_completions(ring);
+            *armed = armed.saturating_sub(completed.len());
+            for (idx, res) in completed {
+                let Some(mut entry) = entries.get_mut(idx).and_then(Option::take) else {
+                    warn!("uring worker: CQE with unexpected user_data {}", idx);
+                    continue;
+                };
+                if res < 0 {
+                    entries[idx] = Some(entry);
+                    break 'serve stop_result(exit, res);
+                }
+                inflight.push(async move {
+                    if let Err(e) = process_async(server, &mut entry).await {
+                        warn!("uring worker: failed to handle request: {e}");
+                        entry.stage_error_reply(libc::EIO);
+                    }
+                    (idx, entry)
+                });
+            }
+            if !ring.submission().is_empty() {
+                if let Err(e) = ring.submit() {
+                    break 'serve Err(e);
+                }
+            }
 
-            let reader = if payload_sz > 0 {
-                // SAFETY: The Reader's buffer 2 and the Writer's body below
-                // both cover the entry's payload area (base + header_len).
-                // This is technically overlapping mutable borrows, but is
-                // sound because:
-                //   (1) The Reader is fully consumed during argument parsing
-                //       (before handle_message returns).
-                //   (2) The Writer only writes to the payload area during
-                //       reply construction (after the Reader is consumed).
-                //   (3) Both slices are constructed via raw pointers inside
-                //       unsafe blocks, so the borrow checker doesn't track
-                //       them across the handle_message call.
-                // A future refactor could eliminate this by using raw
-                // pointers in both Reader and Writer APIs.
-                let entry_payload =
-                    unsafe { std::slice::from_raw_parts_mut(base.add(header_len), payload_sz) };
-                Reader::<()>::from_uring_buffers(header_scratch, entry_payload)?
-            } else {
-                Reader::<()>::from_fuse_buffer(FuseBuf::new(header_scratch))?
-            };
-
-            // The reply header goes into entry.in_out[0..OUT_HEADER_SIZE] and
-            // the reply body goes directly into the entry's payload area.
-            // See SAFETY comment above regarding overlap with Reader's buffer 2.
-            let in_out_header = unsafe { std::slice::from_raw_parts_mut(base, OUT_HEADER_SIZE) };
-            let payload_area =
-                unsafe { std::slice::from_raw_parts_mut(base.add(header_len), entry.payload_cap) };
-            let writer = UringWriter::<()>::new(in_out_header, payload_area);
-
-            self.server
-                .handle_message(reader, writer, None, None)
-                .map_err(|e| {
-                    SessionFailure(format!(
-                        "uring: handle message unique 0x{:x}: {}",
-                        in_header.unique, e
-                    ))
-                })?
+            tokio::select! {
+                biased;
+                Some(done) = inflight.next(), if !inflight.is_empty() => {
+                    let mut done = Some(done);
+                    while let Some((idx, entry)) = done {
+                        let pushed = push_commit(ring, fd, &entry, idx);
+                        entries[idx] = Some(entry);
+                        if let Err(e) = pushed {
+                            break 'serve Err(e);
+                        }
+                        *armed += 1;
+                        done = inflight.next().now_or_never().flatten();
+                    }
+                }
+                ready = ring_ready.readable() => match ready {
+                    // Clear the readiness before draining the completion
+                    // queue at the top of the loop, so a completion that
+                    // arrives in between makes the fd readable again.
+                    Ok(mut guard) => guard.clear_ready(),
+                    Err(e) => break 'serve Err(e),
+                },
+                _ = tokio::time::sleep(EXIT_POLL), if *armed == 0 => {
+                    if exit.load(Ordering::Relaxed) {
+                        break 'serve Ok(());
+                    }
+                }
+            }
         };
 
-        if total > 0 {
-            // The scatter writer already placed the reply directly in the
-            // entry areas; just record the payload size and validate.
-            if total < OUT_HEADER_SIZE || total > OUT_HEADER_SIZE + entry.payload_cap {
-                return Err(SessionFailure(format!(
-                    "uring: malformed reply of {} bytes for unique 0x{:x}",
-                    total, in_header.unique
-                )));
+        // Let the requests in flight finish before release_entries() can
+        // free their entries, because a handler may have a read into its
+        // entry pending in the kernel. Their replies still go out if the
+        // connection is up. Handlers that don't finish in time are leaked
+        // with their entries, so a stuck one can't hang the shutdown.
+        let drain = async {
+            while let Some((idx, entry)) = inflight.next().await {
+                if push_commit(ring, fd, &entry, idx).is_ok() {
+                    *armed += 1;
+                }
+                entries[idx] = Some(entry);
             }
-            let payload_len = total - OUT_HEADER_SIZE;
-            entry.header_mut().ring_ent_in_out.payload_sz = payload_len as u32;
-        } else {
-            // Forget-like requests carry no reply.
-            entry.header_mut().ring_ent_in_out.payload_sz = 0;
+        };
+        if tokio::time::timeout(DRAIN_TIMEOUT, drain).await.is_err() {
+            warn!(
+                "uring worker: leaking {} requests whose handlers didn't finish",
+                inflight.len()
+            );
+            std::mem::forget(inflight);
         }
-
-        Ok(())
+        result
     }
+}
+
+/// How long a stopping async worker waits for its handlers to finish.
+#[cfg(feature = "async-io")]
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often an async worker without armed entries checks whether the
+/// serving layer is stopping.
+#[cfg(feature = "async-io")]
+const EXIT_POLL: Duration = Duration::from_millis(100);
+
+#[cfg(feature = "async-io")]
+async fn process_async<F: AsyncFileSystem + Sync>(
+    server: &Server<F>,
+    entry: &mut UringEntry,
+) -> Result<()> {
+    let Some((unique, reader, writer)) = entry.request()? else {
+        return Ok(());
+    };
+    // Safe because the reader and writer borrow `entry`, which the request
+    // future owns, and the worker never drops a request future before it
+    // completes.
+    let total = unsafe { server.async_handle_message(reader, writer, None, None) }
+        .await
+        .map_err(|e| SessionFailure(format!("uring: handle message unique 0x{unique:x}: {e}")))?;
+    entry.finish(unique, total)
+}
+
+/// Take all completions off the completion queue, as pairs of entry index
+/// and result.
+fn drain_completions(ring: &mut FuseRing) -> Vec<(usize, i32)> {
+    ring.completion()
+        .map(|cqe| (cqe.user_data() as usize, cqe.result()))
+        .collect()
+}
+
+/// What a worker returns after a command failed with `res`. It is `Ok` if
+/// the serving layer is stopping, which fails the commands as it tears the
+/// connection down, and the error otherwise. A failed command leaves the
+/// entry in an undefined state, so the worker stops instead of guessing.
+fn stop_result(exit: &AtomicBool, res: i32) -> io::Result<()> {
+    if exit.load(Ordering::Relaxed) {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(-res))
+    }
+}
+
+/// Queue the `COMMIT_AND_FETCH` for the entry at `idx`, which hands its
+/// staged reply to the kernel and registers it for the next request.
+fn push_commit(ring: &mut FuseRing, fd: RawFd, entry: &UringEntry, idx: usize) -> io::Result<()> {
+    let commit_id = entry.header().ring_ent_in_out.commit_id;
+    let sqe = entry.cmd_sqe(
+        fd,
+        FUSE_IO_URING_CMD_COMMIT_AND_FETCH,
+        commit_id,
+        idx as u64,
+    );
+    loop {
+        // Safe because release_entries() keeps the entries alive while the
+        // kernel holds them.
+        if unsafe { ring.submission().push(&sqe) }.is_ok() {
+            return Ok(());
+        }
+        // The submission queue can never hold more outstanding commits than
+        // completed entries, so submitting must eventually make room.
+        ring.submit()?;
+    }
+}
+
+/// How long a stopping worker waits for the kernel to give back the ring
+/// entries it still holds.
+const RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Drop `ring` and `entries` once the kernel holds none of the entries.
+///
+/// The kernel may copy a request into an entry until it completes the
+/// entry's command, and closing the ring only cancels the commands later,
+/// from a workqueue. So wait for the `armed` outstanding completions first,
+/// which arrive quickly once the connection is torn down. If they don't
+/// arrive within `RELEASE_TIMEOUT`, leak the entries instead of freeing
+/// memory the kernel may still write to.
+fn release_entries(mut ring: FuseRing, entries: Vec<UringEntry>, mut armed: usize) {
+    let deadline = Instant::now() + RELEASE_TIMEOUT;
+    while armed > 0 {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        let ts = types::Timespec::new()
+            .sec(left.as_secs())
+            .nsec(left.subsec_nanos());
+        let args = types::SubmitArgs::new().timespec(&ts);
+        match ring.submitter().submit_with_args(1, &args) {
+            Ok(_) => {}
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ETIME | libc::EINTR)) => {}
+            Err(_) => break,
+        }
+        armed = armed.saturating_sub(ring.completion().count());
+    }
+    if armed > 0 {
+        warn!("uring worker: leaking {armed} ring entries that the kernel still holds");
+        std::mem::forget(entries);
+    }
+    drop(ring);
 }
 
 /// Serve FUSE requests over io_uring (experimental).
@@ -818,9 +1163,21 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
     /// accepted the capability, returning `Error::UringNotSupported`
     /// otherwise so that the caller can fall back to the classic transport.
     pub fn new(
+        session: FuseSession,
+        server: Arc<Server<F>>,
+        cfg: UringConfig,
+    ) -> Result<UringFuseServing<F>> {
+        Self::start(session, server, cfg, UringWorker::run, Self::fallback_sync)
+    }
+
+    /// Handle INIT, then start the workers, each running `run`, and the
+    /// fallback thread that `fallback` prepares.
+    fn start(
         mut session: FuseSession,
         server: Arc<Server<F>>,
         cfg: UringConfig,
+        run: RunFn<F>,
+        fallback: FallbackFn<F>,
     ) -> Result<UringFuseServing<F>> {
         warn!("FUSE-over-io_uring transport is experimental, the kernel interface may change");
 
@@ -830,7 +1187,6 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
         // The first message on a new connection is always FUSE_INIT; handle
         // it on a classic channel and verify the negotiation outcome.
         let mut init_ch = session.new_channel()?;
-        let fallback_ch = session.new_channel()?;
         match init_ch.get_request() {
             Ok(Some((reader, writer))) => {
                 server
@@ -893,7 +1249,7 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
                     // Registration failures are reported through
                     // ready_tx; the return value only carries the error
                     // out of the thread, which nobody reads.
-                    let _ = worker.run(exit, ready_tx);
+                    let _ = run(worker, exit, ready_tx);
                 }
             });
             match handle {
@@ -926,14 +1282,21 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
             }
         }
 
+        let fallback = match fallback(&mut session, server, exit.clone()) {
+            Ok(body) => body,
+            Err(e) => {
+                set.stop(&mut session, true);
+                return Err(e);
+            }
+        };
+        let (fallback_tx, fallback_rx) = channel();
         let fallback = match thread::Builder::new()
             .name("uring-fallback".to_string())
             .spawn({
-                let exit = exit.clone();
                 let tracker = tracker.clone();
                 move || {
                     let _exited = tracker.exit_guard();
-                    Self::fallback_loop(fallback_ch, server, exit)
+                    fallback(fallback_tx)
                 }
             }) {
             Ok(handle) => handle,
@@ -943,12 +1306,34 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
             }
         };
         set.push(fallback);
+        // A fallback thread that panicked while starting, e.g. creating its
+        // async runtime, dropped the sender without sending.
+        if fallback_rx.recv().is_err() {
+            set.stop(&mut session, true);
+            return Err(SessionFailure(
+                "uring: fallback thread exited during startup".to_string(),
+            ));
+        }
 
         Ok(UringFuseServing {
             session,
             workers: set,
             _fs: std::marker::PhantomData,
         })
+    }
+
+    /// Serve the requests that come through `/dev/fuse` with the synchronous
+    /// handlers.
+    fn fallback_sync(
+        session: &mut FuseSession,
+        server: Arc<Server<F>>,
+        exit: Arc<AtomicBool>,
+    ) -> Result<Box<dyn FnOnce(Sender<()>) + Send>> {
+        let ch = session.new_channel()?;
+        Ok(Box::new(move |ready| {
+            let _ = ready.send(());
+            Self::fallback_loop(ch, server, exit)
+        }))
     }
 
     fn fallback_loop(mut ch: FuseChannel, server: Arc<Server<F>>, exit: Arc<AtomicBool>) {
@@ -977,6 +1362,56 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
                 break;
             }
         }
+    }
+}
+
+#[cfg(feature = "async-io")]
+impl<F: AsyncFileSystem + Send + Sync + 'static> UringFuseServing<F> {
+    /// Create an io_uring serving transport that serves requests with the
+    /// asynchronous handlers of `F`.
+    ///
+    /// This works like [`Self::new()`], but every worker runs an async
+    /// runtime from `async_runtime::Runtime::new()` and serves each request
+    /// in its own future, up to one per ring entry it registered. So a
+    /// handler that waits, for example on a remote store, doesn't hold up
+    /// the worker's other requests. `UringConfig::entries_per_queue` bounds
+    /// how many requests sent from one CPU can wait at the same time, so
+    /// set it higher than for synchronous handlers.
+    ///
+    /// The requests that the kernel sends through `/dev/fuse`, such as
+    /// INTERRUPT and the ones it queued before the workers registered their
+    /// entries, go to a `FuseDevTask`, which also uses the asynchronous
+    /// handlers. A stopping worker waits up to 10 seconds for its handlers
+    /// to finish, and leaks the requests of the ones that don't.
+    pub fn new_async(
+        session: FuseSession,
+        server: Arc<Server<F>>,
+        cfg: UringConfig,
+    ) -> Result<UringFuseServing<F>> {
+        Self::start(
+            session,
+            server,
+            cfg,
+            UringWorker::run_async,
+            Self::fallback_async,
+        )
+    }
+
+    /// Serve the requests that come through `/dev/fuse` with the asynchronous
+    /// handlers, on a `FuseDevTask` with a file description of its own.
+    fn fallback_async(
+        session: &mut FuseSession,
+        server: Arc<Server<F>>,
+        exit: Arc<AtomicBool>,
+    ) -> Result<Box<dyn FnOnce(Sender<()>) + Send>> {
+        let file = session.clone_fuse_file()?;
+        let buf_size = session.bufsize();
+        Ok(Box::new(move |ready| {
+            let runtime = Runtime::new();
+            let mut task = FuseDevTask::new(buf_size, file, server, exit);
+            let _ = ready.send(());
+            runtime.block_on(task.poll_handler());
+        }))
     }
 }
 
@@ -1128,7 +1563,7 @@ mod tests {
         assert_eq!(entry.qid, 3);
 
         let header_len = std::mem::size_of::<FuseUringReqHeader>();
-        let total = header_len + payload_cap + 2 * (FUSE_HEADER_SIZE + payload_cap);
+        let total = header_len + payload_cap + REQ_SCRATCH_SIZE;
         assert_eq!(entry.mem.len(), total);
 
         // The iovec array must describe the header and payload areas of the
@@ -1273,6 +1708,359 @@ mod tests {
 
         // Body should contain file data starting at offset 8.
         assert_eq!(&body[..16], &(8..24).collect::<Vec<u8>>()[..]);
+    }
+
+    #[test]
+    fn test_uring_writer_write_from_at_ignores_header_space() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.as_path().join("data");
+        std::fs::write(&path, [0u8; 64]).unwrap();
+
+        // The header slot is still empty, so the writer has room for 24
+        // bytes, but only 8 of them are in the body, where file data goes.
+        let mut hdr = vec![0u8; OUT_HEADER_SIZE];
+        let mut body = vec![0u8; 8];
+        let mut w = UringWriter::<'_, ()>::new(&mut hdr, &mut body);
+        assert_eq!(w.available_bytes(), OUT_HEADER_SIZE + 8);
+        assert!(w.write_from_at(File::open(&path).unwrap(), 16, 0).is_err());
+        assert_eq!(
+            w.write_from_at(File::open(&path).unwrap(), 8, 0).unwrap(),
+            8
+        );
+    }
+
+    #[cfg(feature = "async-io")]
+    #[test]
+    fn test_uring_writer_async() {
+        use fuse_backend_core::async_file::File as AsyncFile;
+        use fuse_backend_core::async_runtime;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.as_path().join("data");
+        std::fs::write(&path, (0..64).collect::<Vec<u8>>()).unwrap();
+
+        let mut hdr = vec![0u8; OUT_HEADER_SIZE];
+        let mut body = vec![0u8; 32];
+        {
+            let mut w = UringWriter::<'_, ()>::new(&mut hdr, &mut body);
+            async_runtime::block_on(async {
+                // Writes fill the header slot first and spill into the body,
+                // like the synchronous writes do.
+                w.async_write_all(&[0xFF; OUT_HEADER_SIZE + 1])
+                    .await
+                    .unwrap();
+                assert_eq!(w.async_write2(&[1], &[2]).await.unwrap(), 2);
+
+                let file = AsyncFile::async_open(&path, false, false).await.unwrap();
+                assert_eq!(w.async_write_from_at(&file, 16, 8).await.unwrap(), 16);
+                assert_eq!(w.async_commit(None).await.unwrap(), OUT_HEADER_SIZE + 19);
+                // More data than the body has left is rejected.
+                assert!(w.async_write_from_at(&file, 16, 0).await.is_err());
+            });
+        }
+
+        assert_eq!(&hdr[..], &[0xFF; OUT_HEADER_SIZE]);
+        assert_eq!(&body[..3], &[0xFF, 1, 2]);
+        assert_eq!(&body[3..19], &(8..24).collect::<Vec<u8>>()[..]);
+    }
+
+    /// The constructor a mount test serves with, `UringFuseServing::new()`
+    /// or `UringFuseServing::new_async()`.
+    type StartFn<F> = fn(FuseSession, Arc<Server<F>>, UringConfig) -> Result<UringFuseServing<F>>;
+
+    /// Mount at `mnt` and serve `server` over io_uring, or return None if
+    /// the kernel rejects FUSE-over-io_uring.
+    fn mount_uring<F: FileSystem + Send + Sync + 'static>(
+        server: Arc<Server<F>>,
+        mnt: &std::path::Path,
+        cfg: UringConfig,
+        start: StartFn<F>,
+    ) -> Option<UringFuseServing<F>> {
+        server.set_uring(true);
+        let mut se = FuseSession::new(mnt, "uring_serving_test", "", false).unwrap();
+        se.mount().unwrap();
+        match start(se, server, cfg) {
+            Ok(serving) => Some(serving),
+            Err(UringNotSupported) => {
+                eprintln!("FUSE-over-io_uring is not available, skipping");
+                None
+            }
+            Err(e) => panic!("uring serving failed: {}", e),
+        }
+    }
+
+    fn passthrough_server(src: &std::path::Path) -> Arc<Server<PassthroughFs<()>>> {
+        let fs = PassthroughFs::<()>::new(Config {
+            root_dir: src.to_string_lossy().to_string(),
+            do_import: false,
+            ..Default::default()
+        })
+        .unwrap();
+        fs.import().unwrap();
+        Arc::new(Server::new(fs))
+    }
+
+    /// Read and write files through a PassthroughFs mounted with `start`,
+    /// then check that dropping the serving layer unmounts it.
+    fn check_passthrough_mount(start: StartFn<PassthroughFs<()>>) {
+        let src = TempDir::new().unwrap();
+        std::fs::write(src.as_path().join("hello"), b"over io_uring").unwrap();
+        let mnt = TempDir::new().unwrap();
+        let cfg = UringConfig {
+            workers: 2,
+            entries_per_queue: 2,
+        };
+        let Some(serving) =
+            mount_uring(passthrough_server(src.as_path()), mnt.as_path(), cfg, start)
+        else {
+            return;
+        };
+
+        assert_eq!(
+            std::fs::read(mnt.as_path().join("hello")).unwrap(),
+            b"over io_uring"
+        );
+        let created = mnt.as_path().join("created");
+        std::fs::write(&created, b"written over io_uring").unwrap();
+        assert_eq!(std::fs::read(&created).unwrap(), b"written over io_uring");
+
+        // Dropping the serving layer tears the connection down, and the
+        // workers get their entries back from the kernel well within
+        // RELEASE_TIMEOUT instead of waiting it out.
+        let start = Instant::now();
+        drop(serving);
+        assert!(start.elapsed() < RELEASE_TIMEOUT);
+        assert!(std::fs::read(mnt.as_path().join("hello")).is_err());
+    }
+
+    #[test]
+    fn test_uring_serving_mount() {
+        check_passthrough_mount(UringFuseServing::new);
+    }
+
+    #[cfg(feature = "async-io")]
+    #[test]
+    fn test_uring_async_serving_mount() {
+        check_passthrough_mount(UringFuseServing::new_async);
+    }
+
+    #[cfg(feature = "async-io")]
+    mod barrier_fs {
+        /// A root directory in which looking up `wait-<n>` succeeds once
+        /// `barrier` has as many lookups waiting as it was created for.
+        pub(super) struct BarrierFs {
+            pub(super) barrier: tokio::sync::Barrier,
+        }
+
+        use std::ffi::CStr;
+        use std::io;
+        use std::time::Duration;
+
+        use async_trait::async_trait;
+        use fuse_backend_core::abi::fuse_abi::{
+            stat64, CreateIn, FsOptions, OpenOptions, SetattrValid, ROOT_ID,
+        };
+        use fuse_backend_core::api::filesystem::{
+            AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, Context, Entry, FileSystem,
+        };
+
+        fn stat(inode: u64) -> stat64 {
+            // Safe because stat64 is plain data.
+            let mut st: stat64 = unsafe { std::mem::zeroed() };
+            st.st_ino = inode;
+            st.st_nlink = 1;
+            st.st_mode = if inode == ROOT_ID {
+                libc::S_IFDIR | 0o755
+            } else {
+                libc::S_IFREG | 0o444
+            };
+            st
+        }
+
+        fn enosys<T>() -> io::Result<T> {
+            Err(io::Error::from_raw_os_error(libc::ENOSYS))
+        }
+
+        impl FileSystem for BarrierFs {
+            type Inode = u64;
+            type Handle = u64;
+
+            fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
+                // Without PARALLEL_DIROPS, the kernel serializes lookups in a
+                // directory.
+                Ok(capable & FsOptions::PARALLEL_DIROPS)
+            }
+        }
+
+        #[allow(unused_variables)]
+        #[async_trait]
+        impl AsyncFileSystem for BarrierFs {
+            async fn async_lookup(
+                &self,
+                ctx: &Context,
+                parent: u64,
+                name: &CStr,
+            ) -> io::Result<Entry> {
+                let name = name.to_str().unwrap_or_default();
+                let Some(n) = name
+                    .strip_prefix("wait-")
+                    .and_then(|n| n.parse::<u64>().ok())
+                else {
+                    return Err(io::Error::from_raw_os_error(libc::ENOENT));
+                };
+                self.barrier.wait().await;
+                Ok(Entry {
+                    inode: ROOT_ID + 1 + n,
+                    generation: 0,
+                    attr: stat(ROOT_ID + 1 + n),
+                    attr_flags: 0,
+                    attr_timeout: Duration::ZERO,
+                    entry_timeout: Duration::ZERO,
+                })
+            }
+
+            async fn async_getattr(
+                &self,
+                ctx: &Context,
+                inode: u64,
+                handle: Option<u64>,
+            ) -> io::Result<(stat64, Duration)> {
+                Ok((stat(inode), Duration::ZERO))
+            }
+
+            async fn async_setattr(
+                &self,
+                ctx: &Context,
+                inode: u64,
+                attr: stat64,
+                handle: Option<u64>,
+                valid: SetattrValid,
+            ) -> io::Result<(stat64, Duration)> {
+                enosys()
+            }
+
+            async fn async_open(
+                &self,
+                ctx: &Context,
+                inode: u64,
+                flags: u32,
+                fuse_flags: u32,
+            ) -> io::Result<(Option<u64>, OpenOptions)> {
+                enosys()
+            }
+
+            async fn async_create(
+                &self,
+                ctx: &Context,
+                parent: u64,
+                name: &CStr,
+                args: CreateIn,
+            ) -> io::Result<(Entry, Option<u64>, OpenOptions)> {
+                enosys()
+            }
+
+            async fn async_read(
+                &self,
+                ctx: &Context,
+                inode: u64,
+                handle: u64,
+                w: &mut (dyn AsyncZeroCopyWriter + Send),
+                size: u32,
+                offset: u64,
+                lock_owner: Option<u64>,
+                flags: u32,
+            ) -> io::Result<usize> {
+                enosys()
+            }
+
+            async fn async_write(
+                &self,
+                ctx: &Context,
+                inode: u64,
+                handle: u64,
+                r: &mut (dyn AsyncZeroCopyReader + Send),
+                size: u32,
+                offset: u64,
+                lock_owner: Option<u64>,
+                delayed_write: bool,
+                flags: u32,
+                fuse_flags: u32,
+            ) -> io::Result<usize> {
+                enosys()
+            }
+
+            async fn async_fsync(
+                &self,
+                ctx: &Context,
+                inode: u64,
+                datasync: bool,
+                handle: u64,
+            ) -> io::Result<()> {
+                enosys()
+            }
+
+            async fn async_fallocate(
+                &self,
+                ctx: &Context,
+                inode: u64,
+                handle: u64,
+                mode: u32,
+                offset: u64,
+                length: u64,
+            ) -> io::Result<()> {
+                enosys()
+            }
+
+            async fn async_fsyncdir(
+                &self,
+                ctx: &Context,
+                inode: u64,
+                datasync: bool,
+                handle: u64,
+            ) -> io::Result<()> {
+                enosys()
+            }
+        }
+    }
+
+    #[cfg(feature = "async-io")]
+    #[test]
+    fn test_uring_async_serving_overlaps_requests() {
+        use barrier_fs::BarrierFs;
+
+        const LOOKUPS: usize = 4;
+        let mnt = TempDir::new().unwrap();
+        let server = Arc::new(Server::new(BarrierFs {
+            barrier: tokio::sync::Barrier::new(LOOKUPS),
+        }));
+        // One worker, with room for all lookups even if they come from the
+        // same CPU. Serving them one at a time would never pass the barrier.
+        let cfg = UringConfig {
+            workers: 1,
+            entries_per_queue: LOOKUPS,
+        };
+        let Some(serving) = mount_uring(server, mnt.as_path(), cfg, UringFuseServing::new_async)
+        else {
+            return;
+        };
+
+        let (tx, rx) = channel();
+        for n in 0..LOOKUPS {
+            let path = mnt.as_path().join(format!("wait-{n}"));
+            let tx = tx.clone();
+            thread::spawn(move || {
+                tx.send(
+                    std::fs::metadata(path)
+                        .map(|_| ())
+                        .map_err(|e| e.to_string()),
+                )
+                .unwrap()
+            });
+        }
+        for _ in 0..LOOKUPS {
+            assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(Ok(())));
+        }
+        drop(serving);
     }
 
     /// A worker over PassthroughFs, for exercising process() without a

@@ -46,6 +46,11 @@
   READDIR, READDIRPLUS and RELEASEDIR with them, so a file system that implements them can
   list a directory without blocking the worker. `Vfs` passes them on to the mounted file
   systems.
+- `UringWriter` implements the asynchronous `Writer` methods, so the async server can reply
+  through the FUSE-over-io_uring transport.
+- `UringFuseServing::new_async()` serves FUSE-over-io_uring with the `AsyncFileSystem` handlers.
+  Each worker runs an async runtime and keeps up to one request per ring entry in flight, so
+  handlers that wait don't hold up the worker's other requests.
 
 ### Changed
 - The FUSE-over-io_uring transport answers opcodes it doesn't know with ENOSYS instead of EIO.
@@ -97,6 +102,19 @@
   to enable them. A crate that depends on a transport crate directly must enable
   that crate's `async-io` too, or its writers fail asynchronous replies with
   `EINVAL`.
+- `UringFuseServing` spreads the ring entries of every kernel queue over its workers instead of
+  giving each worker whole queues, so a busy queue no longer leaves the other workers idle.
+  Sequential writes through the writeback cache got about 45% faster with 4 workers.
+  `UringConfig::workers` can now exceed the number of queues, up to `entries_per_queue` times
+  it, and an `entries_per_queue` of 0 counts as 1.
+- The FUSE-over-io_uring transport answers opcodes it doesn't know with ENOSYS instead of EIO.
+  Kernels that send `FUSE_STATX` only fall back to `FUSE_GETATTR` after ENOSYS, so `statx()`
+  calls that ask for more than the basic fields, like the birth time `stat(1)` shows, failed.
+- `UringWriter::write_from_at()` fails when the data doesn't fit into the reply body. It used to
+  count free space in the header slot too, and could write past the end of the body.
+- A stopping `UringFuseServing` worker waits until the kernel gives back its ring entries before
+  it frees them, and leaks them if that takes more than a second. Before, the kernel could copy
+  a request into freed memory. Each entry also uses about a third of the memory it used to.
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): `fuse-backend-rs` is now a thin facade re-exporting the sub-crates. Every
   historical `fuse_backend_rs::{abi, api, buffer, common, transport, passthrough,
   overlayfs}` import path and cargo feature name (`fusedev`, `virtiofs`,
