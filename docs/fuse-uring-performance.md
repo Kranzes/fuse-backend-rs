@@ -21,13 +21,36 @@ filecreate achieves **3.7x** throughput compared to sync.
 
 ### Sequential I/O: Known Regression
 
+These numbers predate the queue ownership fix described below.
+
 | Workload | 1-thread | 8-thread |
 |----------|----------|----------|
 | seqread | -44 to +5% | **-37%** |
 | seqwrite | -1 to -15% | **-28 to -34%** |
 
-The sequential I/O regression is a **known upstream limitation**, not a bug in
-this implementation. See "Root Cause Analysis" below.
+Most of the seqwrite regression came from how the workers shared the queues,
+which is fixed now. "Queue ownership" below explains it. The rest of the
+sequential I/O gap may come from the upstream changes described in "Root
+Cause Analysis".
+
+## Queue ownership
+
+The kernel puts each request on the queue of the CPU that sends it. With the
+writeback cache, the flusher thread sends the WRITEs, from one CPU at a time.
+The workers used to own whole queues, so the worker that owned that CPU's
+queue served every WRITE while the others waited for requests. Over a few
+seconds the flusher moves between CPUs, so the per-thread CPU time looked
+evenly spread, but at any moment one worker was writing.
+
+Profiling a 4-job 1 MiB seqwrite through the writeback cache with 4 workers
+showed the uring workers spending most of their samples in
+`io_cqring_wait`, waiting for requests, while the sync threads were busy in
+`ext4_buffered_write_iter`. Now the entries of every queue are spread over
+the workers, and the kernel hands a request to any free entry of its queue,
+so a queue that gets more requests than one worker can serve reaches the
+other workers too. In that profile run, seqwrite went from
+3.99 GiB/s to 5.79 GiB/s, against 6.83 GiB/s for sync. The workers now
+contend on the backing file's inode lock, as the sync threads do.
 
 ## Root Cause Analysis
 
@@ -42,7 +65,8 @@ this implementation. See "Root Cause Analysis" below.
    Both classic and uring paths benefit equally.
 
 3. **Not pipeline depth**: Increasing `entries_per_queue` from 4 to 16 had
-   zero impact on sequential I/O performance.
+   zero impact on sequential I/O performance, when each worker owned whole
+   queues.
 
 ### What It Is
 
@@ -138,9 +162,9 @@ When Linux 7.3+ is available on target systems:
 
 ### Tuning Recommendations
 
-- `entries_per_queue`: Default is 4. Increasing to 16+ does not help
-  sequential I/O (bottleneck is elsewhere), but may help high-concurrency
-  metadata workloads.
+- `entries_per_queue`: Default is 4. The entries of each queue are spread
+  over the workers, so it also caps how many workers can serve one queue.
+  With the default, a busy queue reaches at most 4 workers.
 
 - Thread count: The per-CPU queue model means optimal performance when
   worker threads match available CPU cores.

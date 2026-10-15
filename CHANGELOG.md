@@ -31,6 +31,11 @@
   transport on `Error::UringNotSupported`.
 
 ### Changed
+- `UringFuseServing` spreads the ring entries of every kernel queue over its workers instead of
+  giving each worker whole queues, so a busy queue no longer leaves the other workers idle.
+  Sequential writes through the writeback cache got about 45% faster with 4 workers.
+  `UringConfig::workers` can now exceed the number of queues, up to `entries_per_queue` times
+  it, and an `entries_per_queue` of 0 counts as 1.
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): `fuse-backend-rs` is now a thin facade re-exporting the sub-crates. Every
   historical `fuse_backend_rs::{abi, api, buffer, common, transport, passthrough,
   overlayfs}` import path and cargo feature name (`fusedev`, `virtiofs`,
