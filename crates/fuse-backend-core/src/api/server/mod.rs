@@ -20,9 +20,9 @@ use std::ffi::CStr;
 use std::io::{self, Read};
 use std::marker::PhantomData;
 use std::mem::size_of;
-use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
 use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::abi::fuse_abi::*;
 use crate::api::filesystem::{Context, FileSystem, ZeroCopyReader, ZeroCopyWriter};
