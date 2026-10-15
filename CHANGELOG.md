@@ -35,6 +35,10 @@
 - `Server::init_state()` and `Server::restore_init()` let a new server take over a connection
   that another server initialized. `abi::fuse_abi::UNIQUE_RESEND` is the bit that the kernel
   sets in requests it sends again after `notify_resend()`.
+- `AsyncFileSystem` methods default to calling their `FileSystem` counterparts, so a
+  file system only implements the handlers it serves asynchronously.
+- `FuseSession::detach()` lazily unmounts a Linux session through `&self`, so the owner of a
+  serving layer can start the teardown while another thread waits in `FuseServing::wait()`.
 
 ### Changed
 - The FUSE-over-io_uring transport answers opcodes it doesn't know with ENOSYS instead of EIO.
@@ -88,6 +92,10 @@
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): Drop the vestigial `vhost` and `virtio-bindings` dependencies that the
   pre-split `vhost-user-fs` build carried but never referenced; `vhost-user-fs`
   is now an alias for the `virtiofs` build.
+
+### Fixed
+- For a session mounted with `set_target_mntns()`, `FuseSession::umount()` unmounts in that
+  mount namespace. It no longer follows a symlink at the mountpoint.
 
 ## [0.14.0]
 ### Added
