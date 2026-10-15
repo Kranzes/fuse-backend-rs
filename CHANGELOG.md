@@ -39,6 +39,8 @@
   file system only implements the handlers it serves asynchronously.
 - `FuseSession::detach()` lazily unmounts a Linux session through `&self`, so the owner of a
   serving layer can start the teardown while another thread waits in `FuseServing::wait()`.
+- `RuntimeType::file_io_blocks()` tells whether async file IO on a runtime type blocks the
+  calling thread, as it does on tokio.
 
 ### Changed
 - The FUSE-over-io_uring transport answers opcodes it doesn't know with ENOSYS instead of EIO.
@@ -57,6 +59,16 @@
   `io-uring` only on Linux, like `tokio-uring`.
 - If io-uring isn't available, `set_runtime_type(RuntimeType::Uring)` returns the probe's
   error, and the fallback warning includes it.
+- On the tokio runtime, the vectored reads and writes of `async_file::File` make one
+  `preadv()`/`pwritev()` call for all buffers instead of one call per buffer.
+  `async_file::preadv()` and `pwritev()` accept more than 1024 buffers and make one call per
+  1024.
+- `PassthroughFs::enable_async_thread_pool(true)` also moves READ and WRITE
+  requests that would block the runtime thread to the blocking thread pool.
+  These are the O_DIRECT and WRITE_KILL_PRIV requests, and on the tokio
+  runtime also READ cache misses and every WRITE. On a file system without
+  `RWF_NOWAIT`, such as tmpfs, overlayfs or FUSE, every READ counts as a cache
+  miss. Each of these requests costs one more copy and a thread handoff.
 - The umbrella crate's `async-io` no longer turns on the `fusedev` and `virtiofs`
   transports. Code that uses the items they gate, such as `abi::virtio_fs`, has
   to enable them. A crate that depends on a transport crate directly must enable
