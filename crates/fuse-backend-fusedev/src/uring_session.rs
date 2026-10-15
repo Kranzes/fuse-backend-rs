@@ -73,11 +73,13 @@ struct SqeMirror {
 #[derive(Clone, Copy, Debug)]
 pub struct UringConfig {
     /// Number of worker threads, each owning one io_uring instance. The
-    /// kernel queues are distributed among the workers round-robin.
-    /// `0` means one worker per online CPU.
+    /// entries of every kernel queue are spread over the workers, so a busy
+    /// queue is served by several workers. `0` means one worker per online
+    /// CPU. The worker count is capped at `entries_per_queue` times the
+    /// number of queues, so that every worker holds at least one entry.
     pub workers: usize,
     /// Number of ring entries registered per kernel queue, i.e. the number
-    /// of in-flight requests each queue may hold.
+    /// of in-flight requests each queue may hold. `0` is treated as 1.
     pub entries_per_queue: usize,
 }
 
@@ -126,6 +128,25 @@ fn possible_cpu_count() -> Result<usize> {
     let content = std::fs::read_to_string("/sys/devices/system/cpu/possible")
         .map_err(|e| SessionFailure(format!("read possible cpu mask: {e}")))?;
     parse_cpu_mask(&content)
+}
+
+/// Assign the ring entries of all queues to `workers` workers, returning
+/// the queue id of every entry each worker registers.
+///
+/// The kernel puts a request on the queue of the CPU that sends it, and a
+/// single flusher thread sends all writeback WRITEs. A worker that owned
+/// whole queues would serve such a stream alone, so the entries of every
+/// queue go to consecutive workers instead. The kernel hands a request to
+/// any free entry of its queue, so a busy queue reaches the other workers
+/// once one worker's entries are all in use.
+fn spread_entries(nr_queues: usize, entries_per_queue: usize, workers: usize) -> Vec<Vec<u16>> {
+    let entries_per_queue = entries_per_queue.max(1);
+    let workers = workers.clamp(1, nr_queues * entries_per_queue);
+    let mut entry_qids = vec![Vec::new(); workers];
+    for entry in 0..nr_queues * entries_per_queue {
+        entry_qids[entry % workers].push((entry / entries_per_queue) as u16);
+    }
+    entry_qids
 }
 
 /// Size of the per-opcode request arguments carried in the entry `op_in`
@@ -549,30 +570,29 @@ impl UringEntry {
     }
 }
 
-/// One io_uring based serving thread, responsible for a subset of the kernel
-/// queues.
+/// One io_uring based serving thread, holding ring entries of several
+/// kernel queues.
 struct UringWorker<F: FileSystem + Send + Sync + 'static> {
     fd: File,
-    qids: Vec<u16>,
-    entries_per_queue: usize,
+    /// Queue id of every ring entry this worker registers.
+    entry_qids: Vec<u16>,
     payload_cap: usize,
     server: Arc<Server<F>>,
 }
 
 impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
     fn run(self, exit: Arc<AtomicBool>, ready_tx: Sender<io::Result<()>>) -> io::Result<()> {
-        let total_entries = self.qids.len() * self.entries_per_queue;
+        let total_entries = self.entry_qids.len();
         let mut ring: IoUring<squeue::Entry128, cqueue::Entry> =
             IoUring::<squeue::Entry128, cqueue::Entry>::generic_builder()
                 .build((total_entries * 2) as u32)?;
         let fd = self.fd.as_raw_fd();
 
-        let mut entries: Vec<UringEntry> = Vec::with_capacity(total_entries);
-        for qid in &self.qids {
-            for _ in 0..self.entries_per_queue {
-                entries.push(UringEntry::new(*qid, self.payload_cap));
-            }
-        }
+        let mut entries: Vec<UringEntry> = self
+            .entry_qids
+            .iter()
+            .map(|&qid| UringEntry::new(qid, self.payload_cap))
+            .collect();
 
         // Register all entries; the CQE of each REGISTER SQE returns once a
         // request has been assigned to the entry.
@@ -835,12 +855,8 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
         } else {
             cfg.workers
         };
-        let workers = workers.min(nr_queues);
-
-        let mut queue_ids: Vec<Vec<u16>> = vec![Vec::new(); workers];
-        for qid in 0..nr_queues {
-            queue_ids[qid % workers].push(qid as u16);
-        }
+        let entry_qids = spread_entries(nr_queues, cfg.entries_per_queue, workers);
+        let workers = entry_qids.len();
 
         let file = session
             .get_fuse_file()
@@ -848,16 +864,15 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
             .try_clone()
             .map_err(|e| SessionFailure(format!("uring: dup fuse fd: {e}")))?;
 
-        // Build one worker per queue set, cloning the fuse fd up front so
+        // Build one worker per entry set, cloning the fuse fd up front so
         // cloning failures are reported before any thread is spawned.
         let mut worker_list = Vec::with_capacity(workers);
-        for ids in queue_ids {
+        for ids in entry_qids {
             worker_list.push(UringWorker {
                 fd: file
                     .try_clone()
                     .map_err(|e| SessionFailure(format!("uring: dup fuse fd: {e}")))?,
-                qids: ids,
-                entries_per_queue: cfg.entries_per_queue,
+                entry_qids: ids,
                 payload_cap,
                 server: server.clone(),
             });
@@ -1009,6 +1024,30 @@ mod tests {
         assert!(parse_cpu_mask("a-b").is_err());
         assert!(parse_cpu_mask("1-2-3").is_err());
         assert!(possible_cpu_count().unwrap() >= 1);
+    }
+
+    #[test]
+    fn test_spread_entries() {
+        // Every queue gets its entries, and each queue is served by
+        // min(entries_per_queue, workers) workers.
+        for (queues, per_queue, workers) in [(24, 16, 4), (24, 4, 24), (4, 2, 3), (1, 1, 8)] {
+            let spread = spread_entries(queues, per_queue, workers);
+            assert_eq!(spread.len(), workers.min(queues * per_queue));
+            for qid in 0..queues as u16 {
+                let owners = spread.iter().filter(|q| q.contains(&qid)).count();
+                let total: usize = spread
+                    .iter()
+                    .map(|q| q.iter().filter(|&&id| id == qid).count())
+                    .sum();
+                assert_eq!(total, per_queue, "queue {qid}");
+                assert_eq!(owners, per_queue.min(spread.len()), "queue {qid}");
+            }
+            // The workers get the same number of entries, give or take one.
+            let sizes: Vec<usize> = spread.iter().map(Vec::len).collect();
+            assert!(sizes.iter().max().unwrap() - sizes.iter().min().unwrap() <= 1);
+        }
+        // Zero entries per queue and zero workers are clamped to 1.
+        assert_eq!(spread_entries(2, 0, 0), vec![vec![0, 1]]);
     }
 
     #[test]
@@ -1251,8 +1290,7 @@ mod tests {
 
         let worker = UringWorker {
             fd: File::open("/dev/null").unwrap(),
-            qids: vec![0],
-            entries_per_queue: 1,
+            entry_qids: vec![0],
             payload_cap: 4096,
             server: Arc::new(Server::new(Arc::new(fs))),
         };
