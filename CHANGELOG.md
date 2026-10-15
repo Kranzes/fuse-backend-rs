@@ -51,16 +51,6 @@
 - `UringFuseServing::new_async()` serves FUSE-over-io_uring with the `AsyncFileSystem` handlers.
   Each worker runs an async runtime and keeps up to one request per ring entry in flight, so
   handlers that wait don't hold up the worker's other requests.
-
-### Changed
-- The FUSE-over-io_uring transport answers opcodes it doesn't know with ENOSYS instead of EIO.
-  Kernels that send `FUSE_STATX` only fall back to `FUSE_GETATTR` after ENOSYS, so `statx()`
-  calls that ask for more than the basic fields, like the birth time `stat(1)` shows, failed.
-- `UringFuseServing` spreads the ring entries of every kernel queue over its workers instead of
-  giving each worker whole queues, so a busy queue no longer leaves the other workers idle.
-  Sequential writes through the writeback cache got about 45% faster with 4 workers.
-  `UringConfig::workers` can now exceed the number of queues, up to `entries_per_queue` times
-  it, and an `entries_per_queue` of 0 counts as 1.
 - Linux kernel FUSE passthrough, from Linux 6.9 on. `FsOptions::PASSTHROUGH` and
   `OpenOptions::PASSTHROUGH` enable it, and the fusedev transport's `fuse_backing_open()` and
   `fuse_backing_close()` register and release backing files. `Server::set_max_stack_depth()` sets
