@@ -104,6 +104,9 @@
   signal that interrupts the worker's wait no longer stops it.
 - `UringWriter::write_from_at()` fails when the data doesn't fit into the reply body. It counted
   free space in the header slot too, and could read file data past the end of the body.
+- READDIR and READDIRPLUS answer ENOMEM when the reply can't hold the reply header plus the
+  requested size. The check left out the header, so a writer short by up to 16 bytes started the
+  listing and failed partway.
 - [278](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/278): Treat `EOPNOTSUPP`/`ENOTSUP` and `ENOSYS` from `getxattr` as "not opaque"
   in `Layer::is_opaque()`, so `OverlayFs::import()` no longer aborts when a layer's
   backing filesystem has no xattr support at all (tmpfs answers `EOPNOTSUPP` to
