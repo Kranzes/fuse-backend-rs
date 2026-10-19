@@ -63,6 +63,10 @@
 - `UringFuseServing::new_async()` serves FUSE-over-io_uring with the `AsyncFileSystem` handlers.
   Each worker runs an async runtime and keeps up to one request per ring entry in flight, so
   handlers that wait don't hold up the worker's other requests.
+- `UringFuseServing::new_async()` serves zero-copy too. `ZeroCopySource::async_write_to_file()`
+  and `AsyncFileReadWriteVolatile::raw_fd()` let `Reader::async_read_to_at()` move zero-copy
+  data, and the fixed-buffer operations of a request run on the worker's ring while its other
+  requests go on.
 
 ### Changed
 - The FUSE-over-io_uring transport answers opcodes it doesn't know with ENOSYS instead of EIO.

@@ -429,6 +429,7 @@ impl<S: Clone> Clone for Reader<'_, S> {
 /// the client pages that FUSE-over-io_uring zero-copy lends a server. Only
 /// the transport can move it, straight into a file. See
 /// `Reader::with_zero_copy()`.
+#[cfg_attr(feature = "async-io", async_trait::async_trait(?Send))]
 pub trait ZeroCopySource: Sync {
     /// Write `count` bytes of the data, starting `pos` bytes into it, to
     /// the file `fd`, at offset `off`, or at the file's position if `off`
@@ -451,6 +452,19 @@ pub trait ZeroCopySource: Sync {
         count: usize,
         take: &mut dyn FnMut(&[u8]) -> io::Result<usize>,
     ) -> io::Result<usize>;
+
+    /// Like `write_to_file()`, for asynchronous handlers. The default
+    /// calls `write_to_file()`, which blocks the thread.
+    #[cfg(feature = "async-io")]
+    async fn async_write_to_file(
+        &self,
+        pos: usize,
+        fd: RawFd,
+        count: usize,
+        off: Option<u64>,
+    ) -> io::Result<usize> {
+        self.write_to_file(pos, fd, count, off)
+    }
 }
 
 /// The zero-copy data of a request, and how much of it was read.
@@ -817,13 +831,33 @@ mod async_io {
             count: usize,
             off: u64,
         ) -> io::Result<usize> {
-            if self.zero_copy_left().is_some() {
-                // The FUSE-over-io_uring transport that moves zero-copy data
-                // serves synchronous handlers only.
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "zero-copy data can't be read asynchronously",
-                ));
+            if let Some(zc) = self.zero_copy_left() {
+                let count = count.min(zc.remaining());
+                let n = match dst.raw_fd() {
+                    Some(fd) => {
+                        zc.src
+                            .async_write_to_file(zc.pos, fd, count, Some(off))
+                            .await?
+                    }
+                    None => {
+                        // Copy the data into memory, then write that.
+                        let mut data = Vec::with_capacity(count);
+                        zc.src.read_to_memory(zc.pos, count, &mut |src| {
+                            let n = src.len().min(count - data.len());
+                            data.extend_from_slice(&src[..n]);
+                            Ok(n)
+                        })?;
+                        let len = data.len();
+                        // Safe because `data` outlives the write and holds
+                        // `len` bytes.
+                        let buf =
+                            unsafe { FileVolatileBuf::from_raw_ptr(data.as_mut_ptr(), len, len) };
+                        dst.async_write_at_volatile(buf, off).await.0?
+                    }
+                };
+                let n = n.min(count);
+                zc.pos += n;
+                return Ok(n);
             }
             // Safe because `bufs` doesn't out-live `self`.
             let bufs = unsafe { self.buffers.prepare_io_buf(count) };
@@ -918,6 +952,30 @@ mod tests {
         let mut file = std::fs::File::open("/dev/null").unwrap();
         assert_eq!(r.read_to(&mut file, 4).unwrap(), 4);
         assert_eq!(*src.0.lock().unwrap(), vec![(0, file.as_raw_fd(), 4, None)]);
+    }
+
+    #[cfg(feature = "async-io")]
+    #[test]
+    fn test_reader_zero_copy_async() {
+        use super::Reader;
+        use crate::async_file::File;
+        use crate::async_runtime::block_on;
+        use std::os::unix::io::AsRawFd;
+
+        // async_read_to_at() hands the zero-copy data to the source, with
+        // the destination's fd.
+        let src = RecordingSource::default();
+        let mut header = vec![0u8; 0];
+        let mut r = Reader::<()>::from_slice(&mut header).with_zero_copy(&src, 8);
+        block_on(async {
+            let file = File::async_open("/dev/null", true, false).await.unwrap();
+            assert_eq!(r.async_read_to_at(&file, 8, 100).await.unwrap(), 5);
+            assert_eq!(
+                *src.0.lock().unwrap(),
+                vec![(0, file.as_raw_fd(), 8, Some(100))]
+            );
+        });
+        assert_eq!(r.available_bytes(), 3);
     }
 
     #[test]
