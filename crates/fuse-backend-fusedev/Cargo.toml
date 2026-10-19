@@ -24,7 +24,7 @@ build = "build.rs"
 # server methods that are gated on the `fusedev` cfg in core.
 fuse-backend-core = { path = "../fuse-backend-core", version = "0.14.0", features = ["fusedev"] }
 async-trait = { version = "0.1.42", optional = true }
-futures-util = { version = "0.3", optional = true, default-features = false, features = ["alloc"] }
+futures-util = { version = "0.3", optional = true, default-features = false, features = ["alloc", "std"] }
 io-uring = { version = "0.5.8", optional = true }
 libc = "0.2.68"
 log = "0.4.6"

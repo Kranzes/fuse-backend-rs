@@ -2019,6 +2019,9 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
         let (ring, mut entries, ()) = self.setup(&ready_tx, |_| Ok(()))?;
         let fd = self.fd.as_raw_fd();
         let state = RingState::new(ring, entries.len());
+        // A handler that panics stops the worker like an error, and the
+        // panic goes on once the kernel has given the entries back.
+        let mut panic = None;
 
         let result = 'serve: loop {
             {
@@ -2040,9 +2043,18 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
                     break 'serve stop_result(&exit, res);
                 }
 
-                if let Err(e) = self.process(entry, idx, &state) {
-                    warn!("uring worker: failed to handle request: {e}");
-                    entry.stage_error_reply(libc::EIO);
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.process(entry, idx, &state)
+                })) {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        warn!("uring worker: failed to handle request: {e}");
+                        entry.stage_error_reply(libc::EIO);
+                    }
+                    Err(payload) => {
+                        panic = Some(payload);
+                        break 'serve Err(handler_panicked());
+                    }
                 }
                 let mut state = lock(&state);
                 if let Err(e) = push_commit(&mut state.ring, fd, entry, idx) {
@@ -2062,6 +2074,10 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
         }
         let (ring, armed) = RingState::into_parts(state);
         release_entries(ring, entries, armed);
+        if let Some(payload) = panic {
+            error!("uring worker: a request handler panicked, the connection is ended");
+            std::panic::resume_unwind(payload);
+        }
         result
     }
 
@@ -2149,13 +2165,21 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
         })?;
         let state = RingState::new(ring, entries.len());
         let mut entries: Vec<Option<UringEntry>> = entries.into_iter().map(Some).collect();
-        let result = runtime.block_on(self.serve_async(&state, ring_ready, &mut entries, &exit));
+        // Like run(), the worker goes on with a handler's panic once the
+        // kernel has given the entries back.
+        let mut panic = None;
+        let result =
+            runtime.block_on(self.serve_async(&state, ring_ready, &mut entries, &exit, &mut panic));
         // The kernel gives the entries back once the connection ends.
         if failed_while_connected(&result, &exit) {
             self.abort.abort();
         }
         let (ring, armed) = RingState::into_parts(state);
         release_entries(ring, entries.into_iter().flatten().collect(), armed);
+        if let Some(payload) = panic {
+            error!("uring worker: a request handler panicked, the connection is ended");
+            std::panic::resume_unwind(payload);
+        }
         result
     }
 
@@ -2178,6 +2202,7 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
         ring_ready: AsyncFd<RawFd>,
         entries: &mut [Option<UringEntry>],
         exit: &AtomicBool,
+        panic: &mut Option<Panic>,
     ) -> io::Result<()> {
         let fd = self.fd.as_raw_fd();
         let mut inflight = FuturesUnordered::new();
@@ -2202,11 +2227,20 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
                     break 'serve stop_result(exit, res);
                 }
                 inflight.push(async move {
-                    if let Err(e) = self.process_async(&mut entry, idx, state).await {
-                        warn!("uring worker: failed to handle request: {e}");
-                        entry.stage_error_reply(libc::EIO);
-                    }
-                    (idx, entry)
+                    let served =
+                        std::panic::AssertUnwindSafe(self.process_async(&mut entry, idx, state))
+                            .catch_unwind()
+                            .await;
+                    let caught = match served {
+                        Ok(Ok(())) => None,
+                        Ok(Err(e)) => {
+                            warn!("uring worker: failed to handle request: {e}");
+                            entry.stage_error_reply(libc::EIO);
+                            None
+                        }
+                        Err(payload) => Some(payload),
+                    };
+                    (idx, entry, caught)
                 });
             }
             let idle = {
@@ -2223,7 +2257,15 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
                 biased;
                 Some(done) = inflight.next(), if !inflight.is_empty() => {
                     let mut done = Some(done);
-                    while let Some((idx, entry)) = done {
+                    while let Some((idx, entry, caught)) = done {
+                        if let Some(payload) = caught {
+                            // The handler may have left a read into the
+                            // entry running, so leak the entry. The kernel
+                            // doesn't hold it.
+                            std::mem::forget(entry);
+                            *panic = Some(payload);
+                            break 'serve Err(handler_panicked());
+                        }
                         {
                             let mut state = lock(state);
                             let pushed = push_commit(&mut state.ring, fd, &entry, idx);
@@ -2254,6 +2296,12 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
             }
         };
 
+        // A failed worker ends the connection now, rather than after the
+        // drain, so the other requests on its queues don't wait for it.
+        if failed_while_connected(&result, exit) {
+            self.abort.abort();
+        }
+
         // Let the requests in flight finish before release_entries() can
         // free their entries, because a handler may have a read into its
         // entry pending in the kernel. Their replies still go out if the
@@ -2265,7 +2313,12 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
                 tokio::select! {
                     biased;
                     done = inflight.next() => {
-                        let Some((idx, entry)) = done else { break };
+                        let Some((idx, entry, caught)) = done else { break };
+                        if let Some(payload) = caught {
+                            std::mem::forget(entry);
+                            panic.get_or_insert(payload);
+                            continue;
+                        }
                         let mut state = lock(state);
                         if push_commit(&mut state.ring, fd, &entry, idx).is_ok() {
                             state.completions.armed += 1;
@@ -2317,7 +2370,8 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
         let (unique, reader, writer) = request.with_zero_copy(zc_io);
         // Safe because the reader and writer borrow `entry`, which the
         // request future owns, and the worker never drops a request future
-        // before it completes.
+        // before it completes. A future whose poll panicked is dropped, but
+        // its entry is leaked.
         let total = unsafe { self.server.async_handle_message(reader, writer, None, None) }
             .await
             .map_err(|e| {
@@ -2350,6 +2404,15 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// serving layer is stopping.
 #[cfg(feature = "async-io")]
 const EXIT_POLL: Duration = Duration::from_millis(100);
+
+/// The payload of a panic that a worker caught.
+#[cfg(feature = "async-io")]
+type Panic = Box<dyn std::any::Any + Send>;
+
+/// The error a worker stops with when a request handler panicked.
+fn handler_panicked() -> io::Error {
+    io::Error::other("a request handler panicked")
+}
 
 /// What a worker returns after a command failed with `res`. It is `Ok` if
 /// the serving layer is stopping, which fails the commands as it tears the
@@ -3308,6 +3371,9 @@ mod tests {
                 name: &CStr,
             ) -> io::Result<Entry> {
                 let name = name.to_str().unwrap_or_default();
+                if name == "panic" {
+                    panic!("LOOKUP panics");
+                }
                 let Some(n) = name
                     .strip_prefix("wait-")
                     .and_then(|n| n.parse::<u64>().ok())
@@ -4013,6 +4079,96 @@ mod tests {
         // Special characters are octal escapes.
         let info = "97 30 0:88 / /tmp/a\\040b rw - fuse.x x rw\n";
         assert_eq!(mount_minor(info, "/tmp/a b".as_ref()), Some(88));
+    }
+
+    /// A file system whose LOOKUP panics.
+    struct PanicFs;
+
+    impl FileSystem for PanicFs {
+        type Inode = u64;
+        type Handle = u64;
+
+        fn lookup(
+            &self,
+            _ctx: &fuse_backend_core::api::filesystem::Context,
+            _parent: u64,
+            _name: &std::ffi::CStr,
+        ) -> io::Result<fuse_backend_core::api::filesystem::Entry> {
+            panic!("LOOKUP panics");
+        }
+
+        fn getattr(
+            &self,
+            _ctx: &fuse_backend_core::api::filesystem::Context,
+            inode: u64,
+            _handle: Option<u64>,
+        ) -> io::Result<(fuse_backend_core::abi::fuse_abi::stat64, Duration)> {
+            // Safe because stat64 is plain data.
+            let mut st: fuse_backend_core::abi::fuse_abi::stat64 = unsafe { std::mem::zeroed() };
+            st.st_ino = inode;
+            st.st_nlink = 1;
+            st.st_mode = libc::S_IFDIR | 0o755;
+            Ok((st, Duration::ZERO))
+        }
+    }
+
+    /// Serve `server` with `start`, look up `panic`, whose handler panics,
+    /// and check that the worker ends the connection: the lookup fails
+    /// instead of waiting forever, and `wait()` returns.
+    fn check_handler_panic<F: FileSystem + Send + Sync + 'static>(
+        server: Arc<Server<F>>,
+        start: StartFn<F>,
+    ) {
+        let mnt = TempDir::new().unwrap();
+        server.set_uring(true);
+        let mut se = FuseSession::new(mnt.as_path(), "uring_panic_test", "", false).unwrap();
+        se.mount().unwrap();
+        if ConnectionAbort::new(se.mountpoint()).path.is_none() {
+            eprintln!("fusectl isn't mounted, skipping");
+            return;
+        }
+        let cfg = UringConfig {
+            workers: 1,
+            entries_per_queue: 1,
+            ..Default::default()
+        };
+        let serving = match start(se, server, cfg) {
+            Ok(serving) => Arc::new(serving),
+            Err(UringNotSupported) => {
+                eprintln!("FUSE-over-io_uring is not available, skipping");
+                return;
+            }
+            Err(e) => panic!("uring serving failed: {}", e),
+        };
+
+        let (tx, rx) = channel();
+        let path = mnt.as_path().join("panic");
+        std::thread::spawn(move || {
+            let _ = tx.send(std::fs::metadata(path).is_err());
+        });
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(true));
+        let (tx, rx) = channel();
+        let waiting = serving.clone();
+        std::thread::spawn(move || {
+            waiting.wait();
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("the worker didn't end the connection after the panic");
+    }
+
+    #[test]
+    fn test_uring_serving_handler_panic() {
+        check_handler_panic(Arc::new(Server::new(PanicFs)), UringFuseServing::new);
+    }
+
+    #[cfg(feature = "async-io")]
+    #[test]
+    fn test_uring_async_serving_handler_panic() {
+        let server = Arc::new(Server::new(barrier_fs::BarrierFs {
+            barrier: tokio::sync::Barrier::new(1),
+        }));
+        check_handler_panic(server, UringFuseServing::new_async);
     }
 
     /// Ending the connection, as a failed worker does, stops every worker,
