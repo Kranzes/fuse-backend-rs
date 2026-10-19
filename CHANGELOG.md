@@ -78,6 +78,9 @@
   Sequential writes through the writeback cache got about 45% faster with 4 workers.
   `UringConfig::workers` can now exceed the number of queues, up to `entries_per_queue` times
   it, and an `entries_per_queue` of 0 counts as 1.
+- `UringFuseServing` workers register their ring entries in rounds, one entry of each queue per
+  worker and round, so requests that arrive together reach different workers. With buffer pools,
+  1 MiB random reads from every CPU went from 530-1050 MiB/s to 1666-1847 MiB/s.
 - A `UringFuseServing` ring entry without a buffer pool allocates about a third of the memory it
   used to. It kept two scratch regions the size of its payload area, but used 168 bytes of one.
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): `fuse-backend-rs` is now a thin facade re-exporting the sub-crates. Every
