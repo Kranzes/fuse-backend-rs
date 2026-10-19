@@ -121,6 +121,8 @@ pub struct UringConfig {
     /// queue are busy. A pool holds at most `entries_per_queue` buffers,
     /// because each entry holds at most one. `0`, or a kernel without
     /// buffer pools, gives every entry a buffer of its own instead.
+    /// `UringFuseServing::new_async()` makes any other value
+    /// `entries_per_queue`.
     pub bufs_per_queue: usize,
     /// Serve the reads and writes of opens that ask for it with zero-copy
     /// (`OpenOptions::IO_URING_ZERO_COPY`, Linux 7.3). The kernel lends the
@@ -2501,9 +2503,9 @@ fn release_entries(mut ring: FuseRing, entries: Vec<UringEntry>, mut armed: usiz
 pub struct UringFuseServing<F: FileSystem + Send + Sync + 'static> {
     session: FuseSession,
     workers: WorkerSet,
-    /// Whether the queues have buffer pools.
+    /// The number of buffers in each queue's pool, or 0 without pools.
     #[cfg(test)]
-    pooled: bool,
+    pool_bufs: usize,
     /// Whether the queues have zero-copy.
     #[cfg(test)]
     zero_copy: bool,
@@ -2729,7 +2731,7 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
             session,
             workers: set,
             #[cfg(test)]
-            pooled: pools.is_some(),
+            pool_bufs: if pools.is_some() { bufs_per_queue } else { 0 },
             #[cfg(test)]
             zero_copy,
             _fs: std::marker::PhantomData,
@@ -2797,11 +2799,20 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringFuseServing<F> {
     /// entries, go to a `FuseDevTask`, which also uses the asynchronous
     /// handlers. A stopping worker waits up to 10 seconds for its handlers
     /// to finish, and leaks the requests of the ones that don't.
+    ///
+    /// A request keeps its payload buffer while its handler waits, so a
+    /// queue's buffer pool gets `entries_per_queue` buffers, whatever
+    /// non-zero `bufs_per_queue` says. With 16 entries and 4 buffers per
+    /// queue, 4 KiB random writes ran 22% slower. A `bufs_per_queue` of 0
+    /// still gives every entry a buffer of its own.
     pub fn new_async(
         session: FuseSession,
         server: Arc<Server<F>>,
-        cfg: UringConfig,
+        mut cfg: UringConfig,
     ) -> Result<UringFuseServing<F>> {
+        if cfg.bufs_per_queue > 0 {
+            cfg.bufs_per_queue = cfg.entries_per_queue;
+        }
         Self::start(
             session,
             server,
@@ -3967,15 +3978,17 @@ mod tests {
             })
     }
 
-    /// Serve a PassthroughFs over io_uring with `start`, each queue's
-    /// buffer pool holding `bufs_per_queue` buffers, and zero-copy if
-    /// `zero_copy`, read and write through the mount, then check that
-    /// dropping the serving layer gets the ring entries back from the kernel
-    /// and unmounts.
+    /// Serve a PassthroughFs over io_uring with `start`, 2 entries and
+    /// `bufs_per_queue` buffers per queue, and zero-copy if `zero_copy`.
+    /// Check that a kernel with buffer pools gives each queue `pool_bufs`
+    /// buffers, read and write through the mount, then check that dropping
+    /// the serving layer gets the ring entries back from the kernel and
+    /// unmounts.
     fn check_passthrough_mount(
         start: StartFn<PassthroughFs<()>>,
         bufs_per_queue: usize,
         zero_copy: bool,
+        pool_bufs: usize,
     ) {
         let src = TempDir::new().unwrap();
         std::fs::write(src.as_path().join("hello"), b"over io_uring").unwrap();
@@ -3992,11 +4005,9 @@ mod tests {
         };
         // Kernels with buffer pools must get them when the config asks, and
         // zero-copy too when the test runs as root.
-        assert_eq!(
-            serving.pooled,
-            bufs_per_queue > 0 && server.uring_bufpool_supported()
-        );
-        if serving.pooled && zero_copy && real_root() {
+        let pooled = server.uring_bufpool_supported();
+        assert_eq!(serving.pool_bufs, if pooled { pool_bufs } else { 0 });
+        if serving.pool_bufs > 0 && zero_copy && real_root() {
             assert!(serving.zero_copy);
         }
         eprintln!(
@@ -4054,18 +4065,19 @@ mod tests {
         for (bufs_per_queue, zero_copy) in
             [(0, false), (1, false), (4, false), (1, true), (4, true)]
         {
-            check_passthrough_mount(UringFuseServing::new, bufs_per_queue, zero_copy);
+            // A pool holds at most as many buffers as the queue has entries.
+            let pool_bufs = bufs_per_queue.min(2);
+            check_passthrough_mount(UringFuseServing::new, bufs_per_queue, zero_copy, pool_bufs);
         }
     }
 
     #[cfg(feature = "async-io")]
     #[test]
     fn test_uring_async_serving_mount() {
-        for (bufs_per_queue, zero_copy) in
-            [(0, false), (1, false), (4, false), (1, true), (4, true)]
-        {
-            check_passthrough_mount(UringFuseServing::new_async, bufs_per_queue, zero_copy);
-        }
+        // A pool gets a buffer per entry, even when the config asks for 1.
+        check_passthrough_mount(UringFuseServing::new_async, 0, false, 0);
+        check_passthrough_mount(UringFuseServing::new_async, 1, false, 2);
+        check_passthrough_mount(UringFuseServing::new_async, 1, true, 2);
     }
 
     #[test]
