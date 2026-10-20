@@ -2324,6 +2324,7 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
                         let mut state = lock(state);
                         if push_commit(&mut state.ring, fd, &entry, idx).is_ok() {
                             state.completions.armed += 1;
+                            let _ = state.ring.submit();
                         }
                         entries[idx] = Some(entry);
                     }
@@ -2482,10 +2483,12 @@ fn release_entries(mut ring: FuseRing, entries: Vec<UringEntry>, mut armed: usiz
                 ) => {}
             Err(_) => break,
         }
-        let len = entries.len();
+        // Count entry completions by their tag, not their index: the async
+        // worker passes only the entries it holds again, which may leave
+        // gaps in the indexes.
         armed = armed.saturating_sub(
             ring.completion()
-                .filter(|cqe| cqe.user_data() < len as u64)
+                .filter(|cqe| cqe.user_data() & ZERO_COPY_FLAG == 0)
                 .count(),
         );
     }
