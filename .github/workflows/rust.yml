@@ -20,7 +20,7 @@ on:
         default: '15'
       variants:
         description: JSON list of variants
-        default: '["baseline-nolog","baseline","e2-hello-ops","e3-one-thread","e4-reap-helper"]'
+        default: '["baseline-nolog","pr-fix"]'
 
 env:
   CARGO_TERM_COLOR: never
@@ -35,7 +35,7 @@ jobs:
       fail-fast: false
       max-parallel: 5
       matrix:
-        variant: ${{ fromJSON(inputs.variants || '["baseline-nolog","baseline","e2-hello-ops","e3-one-thread","e4-reap-helper"]') }}
+        variant: ${{ fromJSON(inputs.variants || '["baseline-nolog","pr-fix"]') }}
         # Two fresh runners per variant, in case the flake depends on the
         # runner rather than the run.
         shard: [1, 2]

@@ -8,11 +8,12 @@
 set -u
 : "${VARIANT:?}" "${SHARD:?}" "${REPEATS:?}" "${OUT:?}"
 
-# baseline-nolog is the control for the debug logging itself: same code as
-# baseline, without go-nfsv4's -d.
-if [ "$VARIANT" != baseline-nolog ]; then
-  export FBR_FUSE_T_DEBUG=1
-fi
+# go-nfsv4's -d debug log hides some failures, so the PR check runs without
+# it, against baseline-nolog: master's code, also without it.
+case $VARIANT in
+  baseline-nolog | pr-fix) ;;
+  *) export FBR_FUSE_T_DEBUG=1 ;;
+esac
 
 FUSE_T_LOGS=$HOME/Library/Logs/fuse-t
 RESULTS=$OUT/results.tsv
