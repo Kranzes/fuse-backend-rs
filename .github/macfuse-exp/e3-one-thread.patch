@@ -1,0 +1,22 @@
+diff --git a/tests/macfuse_smoke.rs b/tests/macfuse_smoke.rs
+index 737e0da..c188893 100644
+--- a/tests/macfuse_smoke.rs
++++ b/tests/macfuse_smoke.rs
+@@ -116,7 +116,7 @@ mod macfuse_tests {
+         info!("test macfuse mountpoint {}", mnt_dir);
+         println!("e2e paths: hello mnt={}", mnt_dir);
+ 
+-        let mut daemon = macfuse::Daemon::new(mnt_dir, 2).unwrap();
++        let mut daemon = macfuse::Daemon::new(mnt_dir, 1).unwrap();
+         daemon.mount().unwrap();
+         assert!(validate_hello_file(mnt_dir));
+         daemon.umount().unwrap();
+@@ -137,7 +137,7 @@ mod macfuse_tests {
+         std::fs::write(format!("{}/hello", src), "hello, fuse").unwrap();
+         std::fs::create_dir(format!("{}/dir", src)).unwrap();
+ 
+-        let mut daemon = passthroughfs::Daemon::new(src, mnt, 2).unwrap();
++        let mut daemon = passthroughfs::Daemon::new(src, mnt, 1).unwrap();
+         daemon.mount().unwrap();
+ 
+         // readdir: the mount exposes the backing directory.

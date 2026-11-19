@@ -1,149 +1,92 @@
+# CI experiment for the flaky macOS smoke tests (hello: EIO on cat;
+# passthrough: EPERM on xattr -w). It lives only on the fork's macfuse-exp
+# branch, which drops every other workflow. It keeps rust.yml's file name and
+# workflow name so `gh workflow run rust.yml --ref macfuse-exp` can dispatch
+# it: workflow_dispatch needs the file to exist on the default branch too.
+#
+# Each job applies one variant's patch over master's code, runs the
+# macfuse_smoke binary REPEATS times on one runner and records every run;
+# the summary job tabulates all jobs. See .github/macfuse-exp/.
 name: Rust
+run-name: macfuse-exp ${{ github.event_name }} ${{ github.sha }}
 
 on:
   push:
     branches: '*'
-  pull_request:
-    branches: [ master ]
   workflow_dispatch:
+    inputs:
+      repeats:
+        description: Smoke-test runs per job
+        default: '15'
+      variants:
+        description: JSON list of variants
+        default: '["baseline-nolog","baseline","e2-hello-ops","e3-one-thread","e4-reap-helper"]'
 
 env:
-  CARGO_TERM_COLOR: always
+  CARGO_TERM_COLOR: never
   RUST_BACKTRACE: 1
 
 jobs:
-  CI:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        arch: [amd64, arm64, ppc64le, riscv64, s390x]
-    steps:
-    - uses: actions/checkout@v3
-    - name: Cache cargo
-      uses: Swatinem/rust-cache@v2.2.0
-      with:
-        cache-on-failure: true
-        key: ${{ runner.os }}-cargo-${{ matrix.arch }}
-
-    - name: Install Rust
-      uses: actions-rs/toolchain@v1
-      with:
-        profile: minimal
-        toolchain: stable
-        override: true
-
-    - name: build and check
-      run: |
-        declare -A rust_target_map=( ["amd64"]="x86_64-unknown-linux-musl" ["arm64"]="aarch64-unknown-linux-musl" ["ppc64le"]="powerpc64le-unknown-linux-gnu" ["riscv64"]="riscv64gc-unknown-linux-gnu" ["s390x"]="s390x-unknown-linux-gnu")
-        RUST_TARGET=${rust_target_map[${{ matrix.arch }}]}
-        cargo install --version 0.2.5 cross
-        rustup component add rustfmt clippy
-        make -e RUST_TARGET=$RUST_TARGET -e CARGO=cross check
-    - name: smoke
-      if: ${{ matrix.arch == 'amd64' }}
-      run: |
-        echo user_allow_other | sudo tee --append /etc/fuse.conf
-        CARGO_HOME=${HOME}/.cargo
-        CARGO_BIN=$(which cargo)
-        # The passthrough link() /proc/self/fd fallback only runs without
-        # CAP_DAC_READ_SEARCH, so run the two link tests built for it
-        # unprivileged before the privileged rows below re-run the whole
-        # suite as root (the other link tests need open_by_handle_at()).
-        ${CARGO_BIN} test -p fuse-backend-passthrough --no-default-features -- --nocapture test_link_symlink test_link_regular
-        # Drive each criterion microbench once (unprivileged: it exercises
-        # PassthroughFs directly, with no mount), so async call-pattern changes
-        # that turn a bench test-double stub into a live path fail the build
-        # here instead of panicking mid-benchmark.
-        make bench-smoke
-        # sudo -E is not supported by sudo-rs (the default sudo on Ubuntu
-        # 26.04 runners) and is silently ignored, which resets HOME and
-        # leaves the rustup shim at ~/.cargo/bin unable to resolve the
-        # default toolchain ("rustup could not choose a version of cargo").
-        # Route the environment through env(1) so it is applied after the
-        # privilege boundary, independent of the sudo env policy: HOME and
-        # RUSTUP_HOME let the cargo/rustc shims find the toolchain, PATH lets
-        # cargo re-resolve rustc through the shim directory.
-        run_privileged() {
-            sudo env HOME="${HOME}" RUSTUP_HOME="${HOME}/.rustup" \
-                CARGO_HOME="${HOME}/.cargo" PATH="${PATH}" \
-                RUST_BACKTRACE=1 CARGO="${CARGO_BIN}" "$@"
-        }
-        run_privileged make test
-        run_privileged make smoke-all
-        sudo chown -R $(id -u):$(id -g) "${HOME}/.cargo"
-
-  MSRV:
-    # `CI` builds on `stable` only, so nothing notices when a change quietly
-    # needs a newer rustc than the declared `rust-version`; the
-    # trait-object-upcasting requirement slipped in exactly that way. Check
-    # with the declared MSRV instead, on a native runner: `--all-features
-    # --all-targets` covers the async-io paths that needed the bump, plus the
-    # drivers, transports and persist stack on top. The dev-only binaries
-    # under tests/ declare no `rust-version` and track the latest
-    # dev-dependencies, whose MSRV is not ours to promise (today
-    # `simple_logger` 5.2 floors `time` at a release needing rustc 1.88), so
-    # they are excluded; the stable-toolchain jobs still build them (`CI`
-    # runs the benchmark smoke, `xfstests` and `benchmark` build the daemons).
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-    - uses: actions/checkout@v3
-    - name: Cache cargo
-      uses: Swatinem/rust-cache@v2.2.0
-      with:
-        cache-on-failure: true
-        key: ${{ runner.os }}-cargo-msrv
-    - name: Read declared MSRV
-      # Take the MSRV from the root manifest instead of pinning a second
-      # copy here: a pin left behind by a later bump would quietly check a
-      # version nobody declares anymore. Cargo still rejects a member whose
-      # own rust-version exceeds the toolchain, so the crate manifests
-      # cannot drift past what this job checks.
-      id: msrv
-      run: |
-        msrv=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-        echo "version=$msrv" >> "$GITHUB_OUTPUT"
-    - name: Install Rust
-      uses: actions-rs/toolchain@v1
-      with:
-        profile: minimal
-        toolchain: ${{ steps.msrv.outputs.version }}
-        override: true
-    - name: Check
-      # No Cargo.lock is tracked, so dependencies are resolved fresh here.
-      # The resolver's default (`allow`) keeps picking versions that need a
-      # newer rustc than the declared MSRV; `fallback` prefers versions the
-      # MSRV can compile, so the job survives a dependency raising its own
-      # rust-version.
-      env:
-        CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
-      run: cargo check --workspace --all-features --all-targets --exclude passthrough --exclude overlay --exclude fuse-backend-rs-benchmark
-
-  Macos-CI:
+  smoke:
+    name: ${{ matrix.variant }} s${{ matrix.shard }}
     runs-on: macos-latest
-    # The e2e mounts a fuse-t filesystem; a hung request through a hard NFS
-    # mount never returns, and without a timeout the job sits for GitHub's
-    # 360-minute default.
-    timeout-minutes: 30
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        variant: ${{ fromJSON(inputs.variants || '["baseline-nolog","baseline","e2-hello-ops","e3-one-thread","e4-reap-helper"]') }}
+        # Two fresh runners per variant, in case the flake depends on the
+        # runner rather than the run.
+        shard: [1, 2]
+    env:
+      VARIANT: ${{ matrix.variant }}
+      SHARD: ${{ matrix.shard }}
+      REPEATS: ${{ inputs.repeats || '15' }}
+      OUT: ${{ github.workspace }}/e2e-out
     steps:
-      - name: Install macfuse
+      # The same install as master's Macos-CI job.
+      - name: Install macfuse and fuse-t
         run: |
           brew install --cask macfuse
-          # fuse-t 1.0.24 (the original pin, 2023-era) emits xattr requests no
-          # macFUSE-shaped daemon can parse, which hung the e2e's hard NFS
-          # mount; 1.2.9 is the current release and is what the e2e runs
-          # against.
           wget https://github.com/macos-fuse-t/fuse-t/releases/download/1.2.9/fuse-t-macos-installer-1.2.9.pkg
           sudo installer -pkg fuse-t-macos-installer-1.2.9.pkg -target /
-      - uses: actions/checkout@v3
-      - name: build and check
+      - uses: actions/checkout@v4
+      - name: Apply the variant patch
         run: |
-          make smoke-macos
+          git apply .github/macfuse-exp/common-debug.patch .github/macfuse-exp/common-instrument.patch
+          if [ -f ".github/macfuse-exp/$VARIANT.patch" ]; then
+            git apply ".github/macfuse-exp/$VARIANT.patch"
+          fi
+          git diff --stat
+      - name: Build the smoke test
+        run: cargo test --features=fusedev,fuse-t --test macfuse_smoke --no-run
+      - name: Run the smoke test ${{ env.REPEATS }} times
+        run: bash .github/macfuse-exp/run.sh
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ matrix.variant }}-s${{ matrix.shard }}
+          path: e2e-out/results.tsv
+          retention-days: 14
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.variant }}-s${{ matrix.shard }}
+          path: e2e-out/
+          retention-days: 14
 
-  deny:
-    name: Cargo Deny
+  summary:
+    needs: smoke
+    if: always()
     runs-on: ubuntu-latest
-    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v3
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: results-*
+          path: results
+      - name: Summarize
+        run: bash .github/macfuse-exp/summarize.sh results

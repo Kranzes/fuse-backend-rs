@@ -1,0 +1,25 @@
+diff --git a/crates/fuse-backend-fusedev/src/fuse_t_session.rs b/crates/fuse-backend-fusedev/src/fuse_t_session.rs
+index 6557389..cb0c8fa 100644
+--- a/crates/fuse-backend-fusedev/src/fuse_t_session.rs
++++ b/crates/fuse-backend-fusedev/src/fuse_t_session.rs
+@@ -375,6 +375,10 @@ fn fuse_kern_mount(
+ ) -> Result<(File, File)> {
+     unsafe { signal(Signal::SIGCHLD, SigHandler::SigDfl) }
+         .map_err(|e| SessionFailure(format!("fail to reset SIGCHLD handler{:?}", e)))?;
++    // CI experiment: go-nfsv4's debug switch, `-d` (fuse-t wiki "Additional
++    // options"; libfuse-t's mount_darwin.c passes it in debug mode). It logs
++    // to ~/Library/Logs/fuse-t.
++    let debug = std::env::var_os("FBR_FUSE_T_DEBUG").is_some();
+ 
+     let (fd0, fd1) = socketpair(
+         AddressFamily::Unix,
+@@ -456,6 +460,9 @@ fn fuse_kern_mount(
+             }
+ 
+             let mut cmd = Command::new(FUSE_NFSSRV_PATH);
++            if debug {
++                cmd.arg("-d");
++            }
+             cmd.arg("--noatime=true")
+                 .arg("--dontbrowse=true")
+                 .args(["--volname", &format!("{}-{}", fsname, subtype)]);

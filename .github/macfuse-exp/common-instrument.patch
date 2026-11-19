@@ -1,0 +1,97 @@
+diff --git a/tests/macfuse_smoke.rs b/tests/macfuse_smoke.rs
+index b730eaf..737e0da 100644
+--- a/tests/macfuse_smoke.rs
++++ b/tests/macfuse_smoke.rs
+@@ -28,7 +28,7 @@ mod macfuse_tests {
+         }
+         println!("files: {}", files);
+ 
+-        let content = exec(format!("cat {}/hello;", dest).as_str()).unwrap();
++        let content = exec_dump(format!("cat {}/hello;", dest).as_str(), &[dest]);
+         if !content.eq("hello, fuse") {
+             error!("content {}:\n is not right\n", content);
+             return false;
+@@ -54,6 +54,41 @@ mod macfuse_tests {
+         Ok(stdout.to_string())
+     }
+ 
++    /// CI experiment: print `ls -la@` of each directory, to show whether
++    /// macOS stored xattrs in AppleDouble `._` files.
++    fn dump(dirs: &[&str]) {
++        for dir in dirs {
++            match Command::new("ls").arg("-la@").arg(dir).output() {
++                Ok(o) => println!(
++                    "=== e2e dump: ls -la@ {}\n{}{}",
++                    dir,
++                    String::from_utf8_lossy(&o.stdout),
++                    String::from_utf8_lossy(&o.stderr)
++                ),
++                Err(e) => println!("=== e2e dump: ls -la@ {}: {}", dir, e),
++            }
++        }
++    }
++
++    /// `exec` that dumps `dirs` before panicking on a failure.
++    fn exec_dump(cmd: &str, dirs: &[&str]) -> String {
++        let output = Command::new("sh")
++            .arg("-c")
++            .arg(cmd)
++            .env("RUST_BACKTRACE", "1")
++            .output()
++            .unwrap();
++        if !output.status.success() || !output.stderr.is_empty() {
++            dump(dirs);
++            panic!(
++                "exec failed: {}: {}",
++                cmd,
++                String::from_utf8_lossy(&output.stderr)
++            );
++        }
++        String::from_utf8_lossy(&output.stdout).to_string()
++    }
++
+     /// Like `exec`, but a failure is an `Err` instead of a panic — for steps
+     /// whose acceptable outcome depends on kernel-side behavior. Unlike
+     /// `exec`, stderr on success is not treated as a failure.
+@@ -79,6 +114,7 @@ mod macfuse_tests {
+         let tmp_dir = TempDir::new().unwrap();
+         let mnt_dir = tmp_dir.as_path().to_str().unwrap();
+         info!("test macfuse mountpoint {}", mnt_dir);
++        println!("e2e paths: hello mnt={}", mnt_dir);
+ 
+         let mut daemon = macfuse::Daemon::new(mnt_dir, 2).unwrap();
+         daemon.mount().unwrap();
+@@ -95,6 +131,7 @@ mod macfuse_tests {
+         let src = src_dir.as_path().to_str().unwrap();
+         let mnt = mnt_dir.as_path().to_str().unwrap();
+         info!("test passthroughfs src {} mountpoint {}", src, mnt);
++        println!("e2e paths: passthrough src={} mnt={}", src, mnt);
+ 
+         // Backing files to look for through the mount.
+         std::fs::write(format!("{}/hello", src), "hello, fuse").unwrap();
+@@ -119,7 +156,10 @@ mod macfuse_tests {
+ 
+         // xattr: set, list, and read through the mount land on the backing
+         // file.
+-        exec(format!("xattr -w user.e2e v {}/hello", mnt).as_str()).unwrap();
++        exec_dump(
++            format!("xattr -w user.e2e v {}/hello", mnt).as_str(),
++            &[src, mnt],
++        );
+         let xattrs = exec(format!("xattr -l {}/hello", mnt).as_str()).unwrap();
+         assert!(xattrs.find("user.e2e").is_some(), "xattrs: {}", xattrs);
+         let value = exec(format!("xattr -p user.e2e {}/hello", mnt).as_str()).unwrap();
+@@ -131,6 +171,13 @@ mod macfuse_tests {
+         let e = try_exec(format!("xattr -p user.e2e.missing {}/hello", mnt).as_str())
+             .expect_err("missing-attribute read through the mount must fail");
+         println!("enoattr through mount: {}", e);
++        // CI experiment: where did the xattr land, on the backing file or
++        // in an AppleDouble ._hello next to it?
++        println!(
++            "e2e backing xattrs: {:?}",
++            try_exec(format!("xattr -l {}/hello", src).as_str())
++        );
++        dump(&[src]);
+ 
+         // link-by-fd: a hard link through the mount shares the backing inode.
+         exec(format!("ln {}/hello {}/hello.lnk", mnt, mnt).as_str()).unwrap();

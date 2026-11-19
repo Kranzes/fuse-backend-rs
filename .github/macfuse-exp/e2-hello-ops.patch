@@ -1,0 +1,152 @@
+diff --git a/tests/example/macfuse.rs b/tests/example/macfuse.rs
+index 08cad0a..7e43c35 100644
+--- a/tests/example/macfuse.rs
++++ b/tests/example/macfuse.rs
+@@ -14,7 +14,9 @@ use std::time::{Duration, SystemTime};
+ 
+ use fuse_backend_rs::abi::fuse_abi::Attr;
+ 
+-use fuse_backend_rs::api::filesystem::{Context, DirEntry, Entry, FileSystem, ZeroCopyWriter};
++use fuse_backend_rs::api::filesystem::{
++    Context, DirEntry, Entry, FileSystem, GetxattrReply, ListxattrReply, ZeroCopyWriter,
++};
+ use fuse_backend_rs::api::{server::Server, BackendFileSystem, Vfs, VfsOptions};
+ use fuse_backend_rs::transport::{FuseChannel, FuseSession};
+ 
+@@ -25,6 +27,11 @@ impl FileSystem for HelloFileSystem {
+     type Handle = u64;
+     #[allow(unused_variables)]
+     fn lookup(&self, _: &Context, parent: Self::Inode, name: &CStr) -> Result<Entry> {
++        // E2: only "hello" exists. Every other name (._hello, .DS_Store,
++        // "..") used to resolve to the hello file too.
++        if name.to_bytes() != b"hello" {
++            return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
++        }
+         let content = "hello, fuse".as_bytes();
+         let now = SystemTime::now();
+         let time = now
+@@ -120,8 +127,9 @@ impl FileSystem for HelloFileSystem {
+         lock_owner: Option<u64>,
+         flags: u32,
+     ) -> Result<usize> {
+-        let offset = offset as usize;
+         let content = "hello, fuse".as_bytes();
++        // E2: a read past the end returns nothing instead of underflowing.
++        let offset = (offset as usize).min(content.len());
+         let mut buf = Vec::<u8>::with_capacity(size as usize);
+         let can_read_size = content.len() - offset;
+         let read_size = if can_read_size < size as usize {
+@@ -199,7 +207,7 @@ impl FileSystem for HelloFileSystem {
+                         | libc::S_IROTH
+                         | libc::S_IXOTH),
+                     st_nlink: 1,
+-                    st_ino: 1,
++                    st_ino: 2,
+                     st_uid: 0,
+                     st_gid: 0,
+                     st_rdev: 0,
+@@ -228,6 +236,104 @@ impl FileSystem for HelloFileSystem {
+     fn access(&self, ctx: &Context, inode: Self::Inode, mask: u32) -> Result<()> {
+         Ok(())
+     }
++
++    // E2: fuse-t 1.2.9 turns ENOSYS into EIO for the caller (fuse-t #132),
++    // so answer the ops a read-only fs can see instead of leaving them at
++    // the ENOSYS default.
++    #[allow(unused_variables)]
++    fn flush(
++        &self,
++        ctx: &Context,
++        inode: Self::Inode,
++        handle: Self::Handle,
++        lock_owner: u64,
++    ) -> Result<()> {
++        Ok(())
++    }
++
++    #[allow(unused_variables)]
++    fn release(
++        &self,
++        ctx: &Context,
++        inode: Self::Inode,
++        flags: u32,
++        handle: Self::Handle,
++        flush: bool,
++        flock_release: bool,
++        lock_owner: Option<u64>,
++    ) -> Result<()> {
++        Ok(())
++    }
++
++    #[allow(unused_variables)]
++    fn fsync(
++        &self,
++        ctx: &Context,
++        inode: Self::Inode,
++        datasync: bool,
++        handle: Self::Handle,
++    ) -> Result<()> {
++        Ok(())
++    }
++
++    #[allow(unused_variables)]
++    fn releasedir(
++        &self,
++        ctx: &Context,
++        inode: Self::Inode,
++        flags: u32,
++        handle: Self::Handle,
++    ) -> Result<()> {
++        Ok(())
++    }
++
++    #[allow(unused_variables)]
++    fn fsyncdir(
++        &self,
++        ctx: &Context,
++        inode: Self::Inode,
++        datasync: bool,
++        handle: Self::Handle,
++    ) -> Result<()> {
++        Ok(())
++    }
++
++    #[allow(unused_variables)]
++    fn getxattr(
++        &self,
++        ctx: &Context,
++        inode: Self::Inode,
++        name: &CStr,
++        size: u32,
++    ) -> Result<GetxattrReply> {
++        Err(std::io::Error::from_raw_os_error(libc::ENOATTR))
++    }
++
++    #[allow(unused_variables)]
++    fn listxattr(&self, ctx: &Context, inode: Self::Inode, size: u32) -> Result<ListxattrReply> {
++        if size == 0 {
++            Ok(ListxattrReply::Count(0))
++        } else {
++            Ok(ListxattrReply::Names(Vec::new()))
++        }
++    }
++
++    #[allow(unused_variables)]
++    fn setxattr(
++        &self,
++        ctx: &Context,
++        inode: Self::Inode,
++        name: &CStr,
++        value: &[u8],
++        flags: u32,
++    ) -> Result<()> {
++        Err(std::io::Error::from_raw_os_error(libc::EROFS))
++    }
++
++    #[allow(unused_variables)]
++    fn removexattr(&self, ctx: &Context, inode: Self::Inode, name: &CStr) -> Result<()> {
++        Err(std::io::Error::from_raw_os_error(libc::ENOATTR))
++    }
+ }
+ 
+ impl BackendFileSystem for HelloFileSystem {
