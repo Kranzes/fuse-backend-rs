@@ -2099,6 +2099,17 @@ mod tests {
         // The mounted file system gets its own inode number and the kernel's handle.
         let polled = vfs.poll(&ctx, VfsInode(0x100_0000_0000_0001), 0, 7, 0, 0);
         assert_eq!(polled.unwrap(), 1 << 16 | 7);
+
+        // A file system without poll() gets the kernel's answer after ENOSYS on Linux, so that
+        // POLL stays on for the other mounts.
+        let two = vfs.mount(Box::new(FakeFileSystemTwo {}), "/y").unwrap();
+        let polled = vfs.poll(&ctx, VfsInode::new(two, 5), 0, 7, 0, 0);
+        if cfg!(target_os = "linux") {
+            let ready = libc::POLLIN | libc::POLLOUT | libc::POLLRDNORM | libc::POLLWRNORM;
+            assert_eq!(polled.unwrap(), ready as u32);
+        } else {
+            assert_eq!(polled.unwrap_err().raw_os_error(), Some(libc::ENOSYS));
+        }
     }
 
     #[test]

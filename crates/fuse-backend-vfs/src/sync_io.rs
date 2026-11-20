@@ -858,9 +858,17 @@ impl FileSystem for Vfs {
         flags: u32,
         events: u32,
     ) -> Result<u32> {
-        match self.get_real_rootfs(inode)? {
+        let result = match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.poll(ctx, idata.ino(), handle, khandle, flags, events),
             (Right(fs), idata) => fs.poll(ctx, idata.ino(), handle, khandle, flags, events),
+        };
+        // On ENOSYS, Linux stops sending POLL and reports every file as ready for reading and
+        // writing.
+        match result {
+            Err(e) if e.raw_os_error() == Some(libc::ENOSYS) && cfg!(target_os = "linux") => {
+                Ok((libc::POLLIN | libc::POLLOUT | libc::POLLRDNORM | libc::POLLWRNORM) as u32)
+            }
+            result => result,
         }
     }
 
