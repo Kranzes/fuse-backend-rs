@@ -918,11 +918,12 @@ mod tests {
         VolatileSlice,
     };
 
+    /// The position, fd, count and file offset of a `write_to_file()` call.
+    type WriteCall = (usize, std::os::unix::io::RawFd, usize, Option<u64>);
+
     /// A zero-copy source that records what it was asked to write.
     #[derive(Default)]
-    struct RecordingSource(
-        std::sync::Mutex<Vec<(usize, std::os::unix::io::RawFd, usize, Option<u64>)>>,
-    );
+    struct RecordingSource(std::sync::Mutex<Vec<WriteCall>>);
 
     impl super::ZeroCopySource for RecordingSource {
         fn write_to_file(
