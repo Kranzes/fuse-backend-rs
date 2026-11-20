@@ -393,20 +393,9 @@ impl<F: FileSystem + Sync> Server<F> {
     /// Wake the poll(2) calls that wait for the file with the kernel handle `kh`, which
     /// `FileSystem::poll()` got. The kernel then polls the file again.
     #[cfg(feature = "fusedev")]
-    pub fn notify_poll_wakeup<W: Writer>(&self, mut w: W, kh: u64) -> Result<usize> {
-        let mut buffer_writer = w.split_at(0).map_err(Error::FailedToSplitWriter)?;
-        let header = OutHeader {
-            len: (size_of::<OutHeader>() + size_of::<NotifyPollWakeupOut>()) as u32,
-            unique: 0,
-            error: NotifyOpcode::Poll as i32,
-        };
-        buffer_writer
-            .write_obj(header)
-            .map_err(Error::FailedToWrite)?;
-        buffer_writer
-            .write_obj(NotifyPollWakeupOut { kh })
-            .map_err(Error::FailedToWrite)?;
-        buffer_writer.commit(None).map_err(Error::InvalidMessage)
+    pub fn notify_poll_wakeup<W: Writer>(&self, w: W, kh: u64) -> Result<usize> {
+        let wakeup = NotifyPollWakeupOut { kh };
+        Self::notify(w, NotifyOpcode::Poll, &[wakeup.as_slice()])
     }
 
     /// Main entrance to handle requests from the transport layer.

@@ -24,8 +24,8 @@ use crate::abi::fuse_abi::{
 };
 #[cfg(feature = "fusedev")]
 use crate::abi::fuse_abi::{
-    NotifyDeleteOut, NotifyInvalEntryOut, NotifyInvalInodeOut, NotifyOpcode, NotifyStoreOut,
-    Notify_Retrieve_Out,
+    NotifyDeleteOut, NotifyInvalEntryOut, NotifyInvalInodeOut, NotifyOpcode, NotifyPollWakeupOut,
+    NotifyStoreOut, Notify_Retrieve_Out,
 };
 #[cfg(all(feature = "fusedev", target_os = "linux"))]
 use crate::abi::fuse_abi::{NotifyPruneOut, EXPIRE_ONLY};
@@ -1250,6 +1250,12 @@ impl<F: FileSystem + Sync> Server<F> {
         Self::async_notify(w, NotifyOpcode::Resend, &[])
             .await
             .map(|_| ())
+    }
+
+    /// The async variant of `notify_poll_wakeup()`.
+    pub async fn async_notify_poll_wakeup<W: Writer>(&self, w: W, kh: u64) -> Result<usize> {
+        let wakeup = NotifyPollWakeupOut { kh };
+        Self::async_notify(w, NotifyOpcode::Poll, &[wakeup.as_slice()]).await
     }
 
     /// The async variant of `notify_increment_epoch()`.
@@ -3057,6 +3063,13 @@ mod tests {
             &[],
             |w| server.notify_resend(w),
             async |w| server.async_notify_resend(w).await,
+        );
+        // The kernel handle.
+        assert_notifies(
+            NotifyOpcode::Poll,
+            &[&7u64.to_ne_bytes()],
+            |w| server.notify_poll_wakeup(w, 7),
+            async |w| server.async_notify_poll_wakeup(w, 7).await,
         );
     }
 
