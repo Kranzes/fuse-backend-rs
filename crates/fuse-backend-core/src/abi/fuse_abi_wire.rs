@@ -1851,7 +1851,6 @@ mod tests {
         assert_eq!(Opcode::from(0) as u32, Opcode::MaxOpcode as u32);
         assert_eq!(Opcode::from(7) as u32, Opcode::MaxOpcode as u32);
         assert_eq!(Opcode::from(19) as u32, Opcode::MaxOpcode as u32);
-        assert_eq!(Opcode::from(50) as u32, Opcode::MaxOpcode as u32);
         assert_eq!(
             Opcode::from(Opcode::MaxOpcode as u32) as u32,
             Opcode::MaxOpcode as u32

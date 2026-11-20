@@ -54,14 +54,15 @@ pub(crate) const UNIQUE: u64 = 42;
 
 /// Builds a request for the root inode with `opcode` and `body`.
 pub(crate) fn request(opcode: Opcode, body: &[u8]) -> Vec<u8> {
-    request_for(opcode, ROOT_ID, body)
+    request_for(opcode as u32, ROOT_ID, body)
 }
 
-/// Builds a request for `nodeid` with `opcode` and `body`.
-pub(crate) fn request_for(opcode: Opcode, nodeid: u64, body: &[u8]) -> Vec<u8> {
+/// Builds a request for `nodeid` with `opcode` and `body`. The opcode can be one that `Opcode`
+/// doesn't name.
+pub(crate) fn request_for(opcode: u32, nodeid: u64, body: &[u8]) -> Vec<u8> {
     let header = InHeader {
         len: (size_of::<InHeader>() + body.len()) as u32,
-        opcode: opcode as u32,
+        opcode,
         unique: UNIQUE,
         nodeid,
         ..Default::default()
