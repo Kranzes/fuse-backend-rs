@@ -1019,8 +1019,8 @@ mod fusedev_tests {
         use nix::errno::Errno;
         use std::os::fd::AsRawFd;
 
-        // Newer kernels send FUSE_STATX and FUSE_COPY_FILE_RANGE_64. Both get ENOSYS, and the
-        // kernel falls back to GETATTR and COPY_FILE_RANGE.
+        // Newer kernels send FUSE_STATX, which PassthroughFs serves, and FUSE_COPY_FILE_RANGE_64,
+        // which gets ENOSYS, so the kernel falls back to COPY_FILE_RANGE.
         let src_dir = TempDir::new().unwrap();
         let mnt_dir = TempDir::new().unwrap();
         let src = src_dir.as_path().to_str().unwrap().to_string();

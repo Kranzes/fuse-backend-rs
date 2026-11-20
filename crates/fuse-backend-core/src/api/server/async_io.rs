@@ -2513,7 +2513,12 @@ mod tests {
     }
 
     /// Like `serve_bytes()`, for an opcode that `Opcode` may not name.
-    async fn serve_raw(server: &Server<DirFs>, opcode: u32, nodeid: u64, body: &[u8]) -> Vec<u8> {
+    async fn serve_raw<F: AsyncFileSystem + Sync>(
+        server: &Server<F>,
+        opcode: u32,
+        nodeid: u64,
+        body: &[u8],
+    ) -> Vec<u8> {
         let mut sync_req = request_for(opcode, nodeid, body);
         let mut sync_reply = vec![0u8; 4096];
         let len = server
@@ -2780,9 +2785,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_async_newer_opcodes_get_enosys() {
-        // SYNCFS, TMPFILE, STATX and COPY_FILE_RANGE_64.
+        // SYNCFS, TMPFILE, STATX and COPY_FILE_RANGE_64 get ENOSYS unless `Opcode` names them.
         let server = Server::new(DirFs::default());
-        for opcode in 50..=53 {
+        for opcode in (50..=53).filter(|&op| matches!(Opcode::from(op), Opcode::MaxOpcode)) {
             let reply = serve_raw(&server, opcode, 1, &[0u8; 64]).await;
             assert_eq!(reply.len(), size_of::<OutHeader>(), "opcode {}", opcode);
             assert_eq!(reply_error(&reply), -libc::ENOSYS, "opcode {}", opcode);
