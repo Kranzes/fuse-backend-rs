@@ -44,6 +44,17 @@ impl Vfs {
         }
         Ok((fs, idata_in, idata_out))
     }
+
+    /// The answer to a FLUSH that the backend answered with `result`.
+    pub(super) fn flush_result(&self, result: Result<()>) -> Result<()> {
+        // With no_open, no mount has open files, and a file system answers ENOSYS so that the
+        // kernel stops sending FLUSH on every close. That's right for every mount.
+        if self.opts.load().no_open {
+            result
+        } else {
+            ok_for_enosys(result)
+        }
+    }
 }
 
 /// The error for a COPY_FILE_RANGE that the backend failed with `e`.
@@ -65,6 +76,38 @@ pub(super) fn syncfs_result(results: impl IntoIterator<Item = Result<()>>) -> Re
             Err(_) => 2,
         })
         .unwrap_or(Ok(()))
+}
+
+/// The answer to a RENAME or RENAME2 with `flags` that the backend answered with `result`.
+pub(super) fn rename_result(result: Result<()>, flags: u32) -> Result<()> {
+    // Linux sends RENAME2 only with flags, and answers its ENOSYS with EINVAL.
+    if flags != 0 && cfg!(target_os = "linux") {
+        errno_for_enosys(result, libc::EINVAL)
+    } else {
+        result
+    }
+}
+
+/// The answer to a LINK that the backend answered with `result`.
+pub(super) fn link_result(result: Result<Entry>) -> Result<Entry> {
+    // Since 6.15 Linux answers LINK's ENOSYS with EPERM.
+    if cfg!(target_os = "linux") {
+        errno_for_enosys(result, libc::EPERM)
+    } else {
+        result
+    }
+}
+
+/// The answer to a GETXATTR of `name` that the backend answered with `result`.
+pub(super) fn getxattr_result(result: Result<GetxattrReply>, name: &CStr) -> Result<GetxattrReply> {
+    let errno = match name.to_bytes() {
+        // Linux reads POSIX ACLs with GETXATTR. It takes ENODATA for no ACL, and EOPNOTSUPP
+        // for an error that fails permission checks, unless ENOSYS came first.
+        #[cfg(target_os = "linux")]
+        b"system.posix_acl_access" | b"system.posix_acl_default" => libc::ENODATA,
+        _ => UNSUPPORTED,
+    };
+    errno_for_enosys(result, errno)
 }
 
 impl FileSystem for Vfs {
@@ -354,12 +397,7 @@ impl FileSystem for Vfs {
                 flags,
             ),
         };
-        // Linux sends RENAME2 only with flags, and answers its ENOSYS with EINVAL.
-        if flags != 0 && cfg!(target_os = "linux") {
-            errno_for_enosys(result, libc::EINVAL)
-        } else {
-            result
-        }
+        rename_result(result, flags)
     }
 
     fn link(
@@ -379,12 +417,7 @@ impl FileSystem for Vfs {
                 .link(ctx, idata_old.ino(), idata_new.ino(), newname)
                 .and_then(|e| self.convert_backend_entry(idata_new, e)),
         };
-        // Since 6.15 Linux answers LINK's ENOSYS with EPERM.
-        if cfg!(target_os = "linux") {
-            errno_for_enosys(result, libc::EPERM)
-        } else {
-            result
-        }
+        link_result(result)
     }
 
     fn open(
@@ -519,13 +552,7 @@ impl FileSystem for Vfs {
             (Left(fs), idata) => fs.flush(ctx, idata.ino(), handle, lock_owner),
             (Right(fs), idata) => fs.flush(ctx, idata.ino(), handle, lock_owner),
         };
-        // With no_open, no mount has open files, and a file system answers ENOSYS so that the
-        // kernel stops sending FLUSH on every close. That's right for every mount.
-        if self.opts.load().no_open {
-            result
-        } else {
-            ok_for_enosys(result)
-        }
+        self.flush_result(result)
     }
 
     fn fsync(&self, ctx: &Context, inode: VfsInode, datasync: bool, handle: u64) -> Result<()> {
@@ -661,13 +688,7 @@ impl FileSystem for Vfs {
             (Left(fs), idata) => fs.getxattr(ctx, idata.ino(), name, size),
             (Right(fs), idata) => fs.getxattr(ctx, idata.ino(), name, size),
         };
-        // Linux reads POSIX ACLs with GETXATTR. It takes ENODATA for no ACL, and EOPNOTSUPP
-        // for an error that fails permission checks, unless ENOSYS came first.
-        #[cfg(target_os = "linux")]
-        if let b"system.posix_acl_access" | b"system.posix_acl_default" = name.to_bytes() {
-            return errno_for_enosys(result, libc::ENODATA);
-        }
-        errno_for_enosys(result, UNSUPPORTED)
+        getxattr_result(result, name)
     }
 
     fn listxattr(&self, ctx: &Context, inode: VfsInode, size: u32) -> Result<ListxattrReply> {
