@@ -6386,8 +6386,7 @@ mod tests {
         let stopped = timed_drop(serving).recv_timeout(Duration::from_secs(5));
         assert!(stopped.expect("the workers didn't stop") < RELEASE_TIMEOUT);
         // The stop unmounted, and left no dead mount behind.
-        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
-        assert_eq!(mount_minor(&mountinfo, &mountpoint), None);
+        assert_eq!(mount_minor_at(&mountpoint), None);
         // A LOOKUP in the busy directory fails once the connection ended.
         // Safe because the path is a valid C string and the fd is open.
         let name = b"missing\0".as_ptr() as *const libc::c_char;
