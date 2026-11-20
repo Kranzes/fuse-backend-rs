@@ -1285,6 +1285,11 @@ mod tests {
     use std::path::Path;
     use vmm_sys_util::tempdir::TempDir;
 
+    /// Held while a test's child has a mount namespace of its own, and by the tests that need
+    /// their mount to have no copy there. A new namespace copies every mount, and a copy keeps
+    /// the connection of a lazily unmounted file system up.
+    static MNTNS_COPY: Mutex<()> = Mutex::new(());
+
     #[test]
     fn test_new_session() {
         let se = FuseSession::new(Path::new("haha"), "foo", "bar", true);
@@ -1348,6 +1353,8 @@ mod tests {
 
     #[test]
     fn test_blocking_channel_exit_on_umount() {
+        // The read below must see the teardown within its timeout.
+        let _ns = MNTNS_COPY.lock().unwrap_or_else(PoisonError::into_inner);
         let dir = TempDir::new().unwrap();
         let mut se = FuseSession::new(dir.as_path(), "foo", "bar", true).unwrap();
         se.mount().unwrap();
@@ -1429,6 +1436,7 @@ mod tests {
             eprintln!("not root, skipping");
             return;
         }
+        let _ns = MNTNS_COPY.lock().unwrap_or_else(PoisonError::into_inner);
         let dir = TempDir::new().unwrap();
         let mut se = FuseSession::new(dir.as_path(), "spare_test", "", false).unwrap();
         se.mount().unwrap();
@@ -1610,6 +1618,7 @@ mod tests {
             eprintln!("not root, skipping");
             return;
         }
+        let _ns = MNTNS_COPY.lock().unwrap_or_else(PoisonError::into_inner);
         let mut cmd = std::process::Command::new("sleep");
         cmd.arg("60");
         // SAFETY: the closure calls only unshare() and mount(), which are async-signal-safe,
