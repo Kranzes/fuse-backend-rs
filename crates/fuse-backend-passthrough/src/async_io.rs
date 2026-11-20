@@ -1425,6 +1425,20 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
         )
     }
 
+    async fn async_syncfs(
+        &self,
+        ctx: &Context,
+        inode: <Self as FileSystem>::Inode,
+    ) -> io::Result<()> {
+        async_relay!(
+            self,
+            ctx,
+            [],
+            self.syncfs(ctx, inode),
+            move |fs: Arc<Self>, ctx: Context| fs.syncfs(&ctx, inode)
+        )
+    }
+
     async fn async_release(
         &self,
         ctx: &Context,
@@ -2919,6 +2933,7 @@ mod tests {
             fs.async_rmdir(&ctx, ROOT_ID, &dir).await.unwrap();
 
             fs.async_statfs(&ctx, ROOT_ID).await.unwrap();
+            fs.async_syncfs(&ctx, ROOT_ID).await.unwrap();
             fs.async_access(&ctx, ROOT_ID, libc::R_OK as u32)
                 .await
                 .unwrap();

@@ -209,7 +209,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
             x if x == Opcode::Write as u32 => self.async_write(ctx).await,
             x if x == Opcode::Statfs as u32 => self.async_statfs(ctx).await,
             #[cfg(not(target_os = "macos"))]
-            x if x == Opcode::Syncfs as u32 => self.syncfs(ctx),
+            x if x == Opcode::Syncfs as u32 => self.async_syncfs(ctx).await,
             x if x == Opcode::Release as u32 => self.async_release(ctx).await,
             x if x == Opcode::Fsync as u32 => self.async_fsync(ctx).await,
             x if x == Opcode::Setxattr as u32 => self.async_setxattr(ctx).await,
@@ -828,6 +828,18 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
 
         match result {
             Ok(st) => ctx.async_reply_ok(Some(Kstatfs::from(st)), None).await,
+            Err(e) => ctx.async_reply_error(e).await,
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    async fn async_syncfs<S: BitmapSlice, W: Writer>(
+        &self,
+        ctx: &mut SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
+        let _: crate::abi::fuse_abi::SyncfsIn = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
+        match self.fs.async_syncfs(ctx.context(), ctx.nodeid()).await {
+            Ok(()) => ctx.async_reply_ok(None::<u8>, None).await,
             Err(e) => ctx.async_reply_error(e).await,
         }
     }
@@ -1896,6 +1908,11 @@ mod tests {
             Ok(statfs_reply())
         }
 
+        fn syncfs(&self, _ctx: &Context, _inode: u64) -> io::Result<()> {
+            self.sync_call();
+            Ok(())
+        }
+
         fn flush(
             &self,
             _ctx: &Context,
@@ -2127,6 +2144,11 @@ mod tests {
         async fn async_statfs(&self, _ctx: &Context, _inode: u64) -> io::Result<statvfs64> {
             self.async_call().await;
             Ok(statfs_reply())
+        }
+
+        async fn async_syncfs(&self, _ctx: &Context, _inode: u64) -> io::Result<()> {
+            self.async_call().await;
+            Ok(())
         }
 
         async fn async_flush(
@@ -2375,6 +2397,19 @@ mod tests {
         // DirFs keeps the default, which answers ENOSYS.
         let reply = serve(&Server::new(DirFs::default()), Opcode::Tmpfile, 1, body).await;
         assert_eq!(reply_error(&reply), -libc::ENOSYS);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn test_async_syncfs() {
+        use crate::abi::fuse_abi::SyncfsIn;
+
+        let server = Server::new(DirFs::default());
+        let reply = serve(&server, Opcode::Syncfs, 1, SyncfsIn::default()).await;
+        assert_eq!(reply.len(), size_of::<OutHeader>());
+        assert_eq!(reply_error(&reply), 0);
+        // The async server awaited async_syncfs().
+        assert_eq!(server.fs.calls(), (1, 1));
     }
 
     #[tokio::test]

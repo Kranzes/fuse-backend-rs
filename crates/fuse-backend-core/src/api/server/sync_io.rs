@@ -924,7 +924,7 @@ impl<F: FileSystem + Sync> Server<F> {
     }
 
     #[cfg(not(target_os = "macos"))]
-    pub(super) fn syncfs<S: BitmapSlice, W: Writer>(
+    fn syncfs<S: BitmapSlice, W: Writer>(
         &self,
         ctx: &mut SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
