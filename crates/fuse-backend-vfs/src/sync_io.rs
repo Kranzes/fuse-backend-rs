@@ -45,6 +45,27 @@ impl Vfs {
         Ok((fs, idata_in, idata_out))
     }
 
+    /// The backend that serves an LSEEK of `inode`, with the inode in it.
+    pub(super) fn lseek_fs(&self, inode: VfsInode) -> Result<(ArcBackFs, VfsInode)> {
+        // With the writeback cache, written data can sit in the kernel's page cache, and the
+        // kernel doesn't write it back before LSEEK, so the file system would report a hole
+        // there. On ENOSYS the kernel seeks with its own file size instead.
+        if self
+            .opts
+            .load()
+            .out_opts
+            .contains(FsOptions::WRITEBACK_CACHE)
+        {
+            return Err(Error::from_raw_os_error(libc::ENOSYS));
+        }
+        // The pseudo fs has only directories. Linux never sends LSEEK for one, and FreeBSD's
+        // own answer for a directory is EINVAL.
+        let (Right(fs), idata) = self.get_real_rootfs(inode)? else {
+            return Err(Error::from_raw_os_error(libc::EINVAL));
+        };
+        Ok((fs, idata))
+    }
+
     /// The answer to a FLUSH that the backend answered with `result`.
     pub(super) fn flush_result(&self, result: Result<()>) -> Result<()> {
         // With no_open, no mount has open files, and a file system answers ENOSYS so that the
@@ -586,22 +607,7 @@ impl FileSystem for Vfs {
         offset: u64,
         whence: u32,
     ) -> Result<u64> {
-        // With the writeback cache, written data can sit in the kernel's page cache, and the
-        // kernel doesn't write it back before LSEEK, so the file system would report a hole
-        // there. On ENOSYS the kernel seeks with its own file size instead.
-        if self
-            .opts
-            .load()
-            .out_opts
-            .contains(FsOptions::WRITEBACK_CACHE)
-        {
-            return Err(Error::from_raw_os_error(libc::ENOSYS));
-        }
-        // The pseudo fs has only directories. Linux never sends LSEEK for one, and FreeBSD's
-        // own answer for a directory is EINVAL.
-        let (Right(fs), idata) = self.get_real_rootfs(inode)? else {
-            return Err(Error::from_raw_os_error(libc::EINVAL));
-        };
+        let (fs, idata) = self.lseek_fs(inode)?;
         match fs.lseek(ctx, idata.ino(), handle, offset, whence) {
             // ENOSYS would turn LSEEK off for every mount. Answer as the kernel would then.
             Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {
@@ -912,7 +918,7 @@ impl FileSystem for Vfs {
 
 /// Answers SEEK_DATA and SEEK_HOLE for a file of `size` bytes without holes, like the kernel's
 /// `generic_file_llseek()`.
-fn seek_without_holes(offset: u64, whence: u32, size: u64) -> Result<u64> {
+pub(super) fn seek_without_holes(offset: u64, whence: u32, size: u64) -> Result<u64> {
     match whence as i32 {
         libc::SEEK_DATA | libc::SEEK_HOLE if offset >= size => {
             Err(Error::from_raw_os_error(libc::ENXIO))

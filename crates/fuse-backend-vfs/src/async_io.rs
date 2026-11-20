@@ -6,7 +6,8 @@ use std::io;
 use async_trait::async_trait;
 
 use super::sync_io::{
-    copy_file_range_error, getxattr_result, link_result, rename_result, syncfs_result,
+    copy_file_range_error, getxattr_result, link_result, rename_result, seek_without_holes,
+    syncfs_result,
 };
 use super::*;
 
@@ -611,6 +612,29 @@ impl AsyncFileSystem for Vfs {
         })
     }
 
+    // Like `lseek()`.
+    async fn async_lseek(
+        &self,
+        ctx: &Context,
+        inode: VfsInode,
+        handle: u64,
+        offset: u64,
+        whence: u32,
+    ) -> Result<u64> {
+        let (fs, idata) = self.lseek_fs(inode)?;
+        match fs
+            .async_lseek(ctx, idata.ino(), handle, offset, whence)
+            .await
+        {
+            // ENOSYS would turn LSEEK off for every mount. Answer as the kernel would then.
+            Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {
+                let (attr, _) = fs.async_getattr(ctx, idata.ino(), Some(handle)).await?;
+                seek_without_holes(offset, whence, attr.st_size as u64)
+            }
+            result => result,
+        }
+    }
+
     // Like `copy_file_range()`.
     async fn async_copy_file_range(
         &self,
@@ -824,6 +848,18 @@ mod tests {
         async fn async_syncfs(&self, _ctx: &Context, _inode: u64) -> Result<()> {
             tokio::task::yield_now().await;
             Ok(())
+        }
+
+        async fn async_lseek(
+            &self,
+            _ctx: &Context,
+            _inode: u64,
+            _handle: u64,
+            offset: u64,
+            _whence: u32,
+        ) -> Result<u64> {
+            tokio::task::yield_now().await;
+            Ok(offset + 1)
         }
 
         async fn async_copy_file_range(
@@ -1063,6 +1099,28 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::ENOSYS));
+    }
+
+    #[tokio::test]
+    async fn test_vfs_async_lseek() {
+        // Without the writeback cache, which keeps Vfs from forwarding LSEEK.
+        let vfs = Vfs::new(VfsOptions {
+            out_opts: FsOptions::empty(),
+            ..Default::default()
+        });
+        vfs.mount(Box::new(AsyncDirFs), "/x").unwrap();
+        // FakeFileSystemOne has no lseek(), and its files are empty.
+        let idx = vfs.mount(Box::new(FakeFileSystemOne {}), "/y").unwrap();
+        let ctx = Context::default();
+        let seek = |inode: VfsInode| vfs.async_lseek(&ctx, inode, 1, 0, libc::SEEK_DATA as u32);
+
+        // AsyncDirFs answers only with its async handler.
+        assert_eq!(seek(MOUNT_FILE.into()).await.unwrap(), 1);
+        let mounted = VfsInode::new(idx, 5);
+        for (inode, errno) in [(mounted, libc::ENXIO), (ROOT_ID.into(), libc::EINVAL)] {
+            let err = seek(inode).await.unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(errno));
+        }
     }
 
     #[tokio::test]
