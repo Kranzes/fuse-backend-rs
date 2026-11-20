@@ -977,11 +977,13 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn setxattr<S: BitmapSlice, W: Writer>(
+    /// Reads the arguments and the body of a SETXATTR request. With `FsOptions::SETXATTR_EXT`, a
+    /// `SetxattrIn2` follows the `SetxattrIn`, and its flags go into the context.
+    pub(super) fn read_setxattr<S: BitmapSlice, W: Writer>(
         &self,
         ctx: &mut SrvContext<'_, F, S, W>,
-    ) -> Result<usize> {
-        let SetxattrIn { size, flags } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
+    ) -> Result<(SetxattrIn, Vec<u8>)> {
+        let setxattr_in = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
         // macFUSE gives bit 29 of the INIT flags another meaning.
         #[cfg(not(target_os = "macos"))]
         let in_size = if self.options.load(Ordering::Acquire) & FsOptions::SETXATTR_EXT.bits() != 0
@@ -996,6 +998,14 @@ impl<F: FileSystem + Sync> Server<F> {
         #[cfg(target_os = "macos")]
         let in_size = size_of::<SetxattrIn>();
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, in_size)?;
+        Ok((setxattr_in, buf))
+    }
+
+    fn setxattr<S: BitmapSlice, W: Writer>(
+        &self,
+        ctx: &mut SrvContext<'_, F, S, W>,
+    ) -> Result<usize> {
+        let (SetxattrIn { size, flags }, buf) = self.read_setxattr(ctx)?;
 
         let (name, value) = split_setxattr_body(&buf, size)?;
         let name = bytes_to_cstr(name).map_err(|e| {

@@ -868,9 +868,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
         &self,
         ctx: &mut SrvContext<'_, F, S, W>,
     ) -> Result<usize> {
-        let SetxattrIn { size, flags } = ctx.r.read_obj().map_err(Error::DecodeMessage)?;
-        let buf =
-            ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, size_of::<SetxattrIn>())?;
+        let (SetxattrIn { size, flags }, buf) = self.read_setxattr(ctx)?;
 
         let (name, value) = split_setxattr_body(&buf, size)?;
         let name = Self::parse_name(name)?;
@@ -2405,6 +2403,32 @@ mod tests {
         let reply = serve(&server, Opcode::Releasedir, 1, release_in).await;
         assert_eq!(server.fs.calls(), (3, 3));
         assert_eq!(reply_error(&reply), -libc::EBADF);
+    }
+
+    // macFUSE gives the INIT bit of SETXATTR_EXT another meaning.
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn test_async_setxattr_ext() {
+        use crate::abi::fuse_abi::SetxattrIn2;
+
+        let server = Server::new(DirFs::default());
+        let (version, _) = server.init_state();
+        server.restore_init(version, FsOptions::SETXATTR_EXT);
+        let setxattr_in = SetxattrIn {
+            size: XATTR_VALUE.len() as u32,
+            flags: 0,
+        };
+        // SetxattrIn2 follows SetxattrIn.
+        let body = [
+            setxattr_in.as_slice(),
+            SetxattrIn2::default().as_slice(),
+            b"user.a\0",
+            XATTR_VALUE,
+        ]
+        .concat();
+        let reply = serve_bytes(&server, Opcode::Setxattr, 2, &body).await;
+        assert_eq!(reply_error(&reply), 0);
+        assert_eq!(server.fs.calls(), (1, 1));
     }
 
     #[tokio::test]
