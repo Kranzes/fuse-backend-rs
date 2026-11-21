@@ -69,6 +69,10 @@
   `system.posix_acl_access` when the kernel sends `SETXATTR_ACL_KILL_SGID`.
   `Vfs` passes the flags to its backends but leaves the option out of its
   default `out_opts`.
+- [343](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/343): `Server::set_request_timeout()` asks Linux 6.14 and later to
+  abort the connection when a request stays unanswered for longer than the
+  given number of seconds, through `FsOptions::REQUEST_TIMEOUT` and the new
+  `InitOut::request_timeout`.
 - [304](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/304): Give FreeBSD a verification path. The Linux wire-format ABI
 - [NNN](link): `VfsOptions::pseudo_dir_mode`, `pseudo_dir_uid` and `pseudo_dir_gid` set the
   permission bits, owner and group of the directories `Vfs` serves itself: its root while no file
@@ -278,6 +282,8 @@
 - [330](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/330): `FileSystem::notify_reply()` takes the retrieved data and returns nothing, which
   breaks file systems that implement it. `NotifyInvalEntryOut::padding` is now `flags`, as in the
   kernel.
+- [343](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/343): `InitOut::unused` is now `[u16; 11]`, because the new
+  `request_timeout` takes its first two bytes.
 - [325](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/325): The `fuse-backend-fusedev` `uring` transport uses io-uring 0.6 instead of 0.5,
   and depends on it only on Linux.
 - [324](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/324): `fuse-backend-core` uses bitflags 2 instead of 1. The flag types (`FsOptions`,
