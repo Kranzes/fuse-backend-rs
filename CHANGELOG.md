@@ -73,6 +73,12 @@
   abort the connection when a request stays unanswered for longer than the
   given number of seconds, through `FsOptions::REQUEST_TIMEOUT` and the new
   `InitOut::request_timeout`.
+- [344](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/344): Handle `FUSE_SYNCFS` (protocol 7.34), which virtiofs sends
+  when the guest syncs the file system. Since Linux 6.18 fuseblk mounts send it
+  too. The new `FileSystem::syncfs()` defaults to `ENOSYS`, after which the
+  kernel stops sending it. `Vfs` syncs every mounted backend when asked for its
+  root, and `PassthroughFs` calls `syncfs(2)` on the shared directory.
+  `Opcode::MaxOpcode` moves to 51.
 - [304](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/304): Give FreeBSD a verification path. The Linux wire-format ABI
 - [NNN](link): `VfsOptions::pseudo_dir_mode`, `pseudo_dir_uid` and `pseudo_dir_gid` set the
   permission bits, owner and group of the directories `Vfs` serves itself: its root while no file

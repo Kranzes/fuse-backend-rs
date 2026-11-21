@@ -343,6 +343,7 @@ fn op_args(opcode: u32, setxattr_ext: bool) -> Option<(usize, bool)> {
         Opcode::Rename2 => (16, false),                      // Rename2In
         Opcode::Lseek => (24, true),                         // LseekIn
         Opcode::CopyFileRange => (56, true),                 // CopyFileRangeIn
+        Opcode::Syncfs => (8, false),                        // SyncfsIn
         Opcode::Tmpfile => (16, true),                       // CreateIn
         Opcode::Statx => (24, true),                         // StatxIn
         // SETUPMAPPING/REMOVEMAPPING only exist on the virtiofs DAX window
@@ -3120,7 +3121,8 @@ mod tests {
         AccessIn, AttrOut, BatchForgetIn, BmapIn, CopyFileRangeIn, CreateIn, EntryOut, FallocateIn,
         FlushIn, ForgetIn, FsyncIn, GetattrIn, GetxattrIn, InHeader, InitIn, InterruptIn, IoctlIn,
         LinkIn, LkIn, LseekIn, MkdirIn, MknodIn, Opcode, OpenIn, OutHeader, PollIn, ReadIn,
-        ReleaseIn, Rename2In, RenameIn, SetattrIn, SetxattrIn, SetxattrIn2, StatxIn, WriteIn, ROOT_ID,
+        ReleaseIn, Rename2In, RenameIn, SetattrIn, SetxattrIn, SetxattrIn2, StatxIn, SyncfsIn,
+        WriteIn, ROOT_ID,
     };
     use fuse_backend_core::api::filesystem::FsOptions;
     use fuse_backend_passthrough::{Config, PassthroughFs};
@@ -3317,6 +3319,7 @@ mod tests {
                 Opcode::CopyFileRange as u32,
                 std::mem::size_of::<CopyFileRangeIn>(),
             ),
+            (Opcode::Syncfs as u32, std::mem::size_of::<SyncfsIn>()),
             (Opcode::Tmpfile as u32, std::mem::size_of::<CreateIn>()),
             (Opcode::Statx as u32, std::mem::size_of::<StatxIn>()),
         ];
@@ -3363,6 +3366,7 @@ mod tests {
             Opcode::BatchForget,
             Opcode::Fallocate,
             Opcode::Rename2,
+            Opcode::Syncfs,
         ];
         for &(op, _) in expected {
             let has_out_args = !no_out_args.iter().any(|&o| o as u32 == op);
