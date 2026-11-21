@@ -55,6 +55,13 @@
 - [335](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/335): `FileSystem::tmpfile()` serves `FUSE_TMPFILE` (protocol 7.37, Linux 6.1), which
   the kernel sends for an `open(2)` with `O_TMPFILE`, in both servers. It defaults to `ENOSYS`.
   `Vfs` passes it on, and `PassthroughFs` serves it with `openat(O_TMPFILE)` on Linux.
+- [340](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/340): Serve FreeBSD's fusefs(5) with the fusedev transport.
+  `FuseSession` mounts with nmount(2), like mount_fusefs(8), and unmounts
+  with `MNT_FORCE`, by file system id. Its channels wait in poll(2), so
+  `SyncFuseServing` runs any number of workers, and an unmount from outside
+  stops all of them. `gmake check-freebsd` also lints and tests fusedev, and
+  as root its tests mount a file system.
+
 - [304](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/304): Give FreeBSD a verification path. The Linux wire-format ABI
 - [NNN](link): `VfsOptions::pseudo_dir_mode`, `pseudo_dir_uid` and `pseudo_dir_gid` set the
   permission bits, owner and group of the directories `Vfs` serves itself: its root while no file
@@ -73,9 +80,7 @@
   (the negotiation clamps it to what the kernel offered), and a GitHub
   Actions job runs `gmake check-freebsd`, so `fuse-backend-core` and
   `fuse-backend-vfs` build and pass their unit tests on a real FreeBSD
-  VM. The transport and the filesystem drivers stay FreeBSD-unbuildable
-  (`nix` 0.24 does not compile there), and nothing here claims runtime
-  behavior against a FreeBSD kernel yet.
+  VM. The filesystem drivers don't build on FreeBSD.
 
 - [303](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/303): Fill in the macOS twin of the passthrough driver, turning the
   PR #182 prototype (akitaSummer's macOS port) into a working mount on top of
