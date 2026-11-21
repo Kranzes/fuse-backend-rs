@@ -71,7 +71,7 @@ use tokio::io::{unix::AsyncFd, Interest};
 use vm_memory::bitmap::BitmapSlice;
 use vm_memory::mmap::MmapRegion;
 
-use crate::linux_session::mount_minor_at;
+use crate::linux_session::open_abort_file;
 use crate::serving::{FuseServing, WorkerSet};
 #[cfg(feature = "async-io")]
 use crate::FuseDevTask;
@@ -1928,26 +1928,18 @@ impl Drop for RoundsGuard<'_> {
 /// Ending the connection fails those requests and the other workers'
 /// commands instead, so every worker stops and `wait()` returns.
 struct ConnectionAbort {
-    /// `/sys/fs/fuse/connections/<minor>/abort`, if fusectl is mounted.
-    path: Option<std::path::PathBuf>,
+    /// The fusectl `abort` file of the connection, or why it can't be opened.
+    file: std::io::Result<File>,
     /// Whether a worker ended the connection already.
     done: AtomicBool,
 }
 
 impl ConnectionAbort {
-    /// The abort file of the connection mounted at `mountpoint`. fusectl
-    /// names connections after the minor number of the mount's device,
-    /// which comes from /proc/self/mountinfo, because a stat() of the
-    /// mountpoint would wait for a FUSE request that nobody serves yet.
-    /// `FuseSession` keeps the mountpoint canonical, as mountinfo has it.
-    fn new(mountpoint: &std::path::Path) -> ConnectionAbort {
-        let path = mount_minor_at(mountpoint)
-            .map(|minor| {
-                std::path::PathBuf::from(format!("/sys/fs/fuse/connections/{minor}/abort"))
-            })
-            .filter(|path| path.exists());
+    /// The abort file of the connection of `session`, see
+    /// [`open_abort_file`].
+    fn new(session: &FuseSession) -> ConnectionAbort {
         ConnectionAbort {
-            path,
+            file: open_abort_file(session),
             done: AtomicBool::new(false),
         }
     }
@@ -1957,13 +1949,10 @@ impl ConnectionAbort {
         if self.done.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        let Some(path) = &self.path else {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "fusectl isn't mounted",
-            ));
-        };
-        std::fs::write(path, b"1")
+        let mut file = self.file.as_ref().map_err(|e| {
+            io::Error::new(e.kind(), format!("can't open its fusectl abort file: {e}"))
+        })?;
+        file.write_all(b"1")
     }
 
     /// End the connection after a worker failed while it was up.
@@ -2853,7 +2842,7 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
 
         // Build one worker per entry set, cloning the fuse fd up front so
         // cloning failures are reported before any thread is spawned.
-        let abort = Arc::new(ConnectionAbort::new(session.mountpoint()));
+        let abort = Arc::new(ConnectionAbort::new(&session));
         let barrier = Arc::new(StopBarrier::new(workers));
         let nr_rounds = spread.iter().flatten().map(|&(_, round)| round + 1).max();
         let rounds = Arc::new(RegisterRounds::new(workers, nr_rounds.unwrap_or(1)));
@@ -3117,6 +3106,7 @@ impl<F: FileSystem + Send + Sync + 'static> FuseServing for UringFuseServing<F> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::linux_session::mount_minor_at;
 
     use vmm_sys_util::tempdir::TempDir;
 
@@ -3779,7 +3769,7 @@ mod tests {
             rounds: Arc::new(RegisterRounds::new(1, 1)),
             server: Arc::new(Server::new(Arc::new(fs))),
             abort: Arc::new(ConnectionAbort {
-                path: None,
+                file: Err(std::io::ErrorKind::NotFound.into()),
                 done: AtomicBool::new(false),
             }),
             barrier: Arc::new(StopBarrier::new(1)),
@@ -4394,7 +4384,7 @@ mod tests {
         let mut se = FuseSession::new(mnt.as_path(), "uring_panic_test", "", false).unwrap();
         se.mount().unwrap();
         let mountpoint = se.mountpoint().to_owned();
-        if ConnectionAbort::new(se.mountpoint()).path.is_none() {
+        if ConnectionAbort::new(&se).file.is_err() {
             eprintln!("fusectl isn't mounted, skipping");
             return;
         }
@@ -4458,10 +4448,7 @@ mod tests {
             zero_copy: false,
         };
         let serving = mount_uring(server, mnt, cfg, start)?;
-        if ConnectionAbort::new(serving.session.mountpoint())
-            .path
-            .is_none()
-        {
+        if ConnectionAbort::new(&serving.session).file.is_err() {
             eprintln!("fusectl isn't mounted, skipping");
             return None;
         }
@@ -4609,8 +4596,8 @@ mod tests {
         let mut se = FuseSession::new(mnt.as_path(), "uring_serving_test", "", false).unwrap();
         se.mount().unwrap();
         let mountpoint = se.mountpoint().to_owned();
-        let abort = ConnectionAbort::new(se.mountpoint());
-        if abort.path.is_none() {
+        let abort = ConnectionAbort::new(&se);
+        if abort.file.is_err() {
             eprintln!("fusectl isn't mounted, skipping");
             return;
         }
