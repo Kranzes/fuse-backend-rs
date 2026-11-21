@@ -8,7 +8,7 @@
 //!
 //! Usage: `fuse-backend-rs-benchmark <src> <mountpoint> [--async] [--uring] [--threads N]
 //! [--sync-blocking] [--thread-pool] [--uring-bufs N] [--uring-zero-copy]
-//! [--no-backing-direct-io] [--kernel-passthrough] [--no-writeback] [--delay-us N]`
+//! [--no-backing-direct-io] [--kernel-passthrough] [--no-writeback] [--delay-us N] [--splice]`
 //!
 //! - default (sync) mode: requests are served by `N` worker threads of the
 //!   `SyncFuseServing` serving layer, each reading from its own fuse channel
@@ -49,6 +49,9 @@
 //! it is served, like a backend that fetches from a remote store. The
 //! synchronous handlers block their thread for that time, the asynchronous
 //! ones sleep without blocking it.
+//!
+//! `--splice` makes the sync mode send READ replies with `splice(2)`, see
+//! `FuseSession::set_splice_write()`.
 
 #[cfg(target_os = "linux")]
 mod delay;
@@ -89,6 +92,7 @@ mod daemon {
         thread_pool: bool,
         kernel_passthrough: bool,
         no_writeback: bool,
+        splice: bool,
         thread_cnt: u32,
         uring_bufs: usize,
         uring_zero_copy: bool,
@@ -128,7 +132,7 @@ mod daemon {
 
     fn help() {
         println!(
-            "Usage:\n   fuse-backend-rs-benchmark <src> <mountpoint> [--async] [--uring] [--threads N] [--sync-blocking] [--thread-pool] [--uring-bufs N] [--uring-zero-copy] [--no-backing-direct-io] [--kernel-passthrough] [--no-writeback] [--delay-us N]\n"
+            "Usage:\n   fuse-backend-rs-benchmark <src> <mountpoint> [--async] [--uring] [--threads N] [--sync-blocking] [--thread-pool] [--uring-bufs N] [--uring-zero-copy] [--no-backing-direct-io] [--kernel-passthrough] [--no-writeback] [--delay-us N] [--splice]\n"
         );
     }
 
@@ -155,6 +159,7 @@ mod daemon {
             thread_pool: false,
             kernel_passthrough: false,
             no_writeback: false,
+            splice: false,
             thread_cnt: 4,
             uring_bufs: UringConfig::default().bufs_per_queue,
             uring_zero_copy: false,
@@ -170,6 +175,7 @@ mod daemon {
                 "--thread-pool" => res.thread_pool = true,
                 "--kernel-passthrough" => res.kernel_passthrough = true,
                 "--no-writeback" => res.no_writeback = true,
+                "--splice" => res.splice = true,
                 "--threads" => {
                     idx += 1;
                     res.thread_cnt = option_value(&args, idx)?;
@@ -195,8 +201,8 @@ mod daemon {
             help();
             return Err(Error::from_raw_os_error(libc::EINVAL));
         }
-        // The blocking knob only configures the sync transport.
-        if res.sync_blocking && (res.as_async || res.as_uring) {
+        // The blocking and splice knobs only configure the sync transport.
+        if (res.sync_blocking || res.splice) && (res.as_async || res.as_uring) {
             help();
             return Err(Error::from_raw_os_error(libc::EINVAL));
         }
@@ -337,7 +343,7 @@ mod daemon {
             }
         }
         info!(
-            "passthrough src {} mountpoint {} mode {} threads {} thread pool {} kernel passthrough {} writeback {} delay {:?}",
+            "passthrough src {} mountpoint {} mode {} threads {} thread pool {} kernel passthrough {} writeback {} delay {:?} splice {}",
             args.src,
             args.dest,
             args.mode(),
@@ -346,6 +352,7 @@ mod daemon {
             args.kernel_passthrough,
             !(args.no_writeback || args.kernel_passthrough),
             args.delay,
+            args.splice,
         );
 
         let backing_files = args
@@ -360,6 +367,7 @@ mod daemon {
             args.no_writeback,
         );
         let mut se = FuseSession::new(Path::new(&args.dest), "bench_passthru", "", false).unwrap();
+        se.set_splice_write(args.splice);
         se.mount().unwrap();
         if let Some(files) = backing_files {
             let fuse_file = se.get_fuse_file().unwrap().try_clone()?;

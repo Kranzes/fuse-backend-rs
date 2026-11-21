@@ -20,6 +20,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use crate::splice::SplicePipes;
 use crate::{FuseChannelExt, FuseDevReaderExt, FuseSessionExt};
 use fuse_backend_core::abi::fuse_abi::BackingMap;
 use libc::c_uint;
@@ -73,6 +74,7 @@ pub struct FuseSession {
     // fusermount binary, default to fusermount3
     fusermount: String,
     mount_flags: Option<MsFlags>,
+    splice_write: bool,
     // Set once detach() has unmounted the file system, so umount() and later detach() calls
     // don't unmount the mountpoint again. Another file system may be mounted there by then, and
     // without a mount ID, is_unmounted() misses that while the detached mount is in use.
@@ -121,6 +123,7 @@ impl FuseSession {
             fusermount: FUSERMOUNT_BIN.to_string(),
             allow_other: true,
             mount_flags: None,
+            splice_write: false,
             detached: Mutex::new(false),
             mount_id: None,
         })
@@ -134,6 +137,22 @@ impl FuseSession {
     /// fusermount through nsenter.
     pub fn set_target_mntns(&mut self, pid: Option<libc::pid_t>) {
         self.target_mntns = pid;
+    }
+
+    /// Send READ replies with `splice(2)` when the file system takes the data
+    /// from a file through `ZeroCopyWriter::write_from()`, as `PassthroughFs`
+    /// does. The data then goes from the file's page cache into the FUSE
+    /// request without a copy through user space. It's off by default.
+    ///
+    /// Channels created afterwards get two pipes each for this. A channel
+    /// copies the replies that don't fit in its pipes, and stops splicing if
+    /// the kernel refuses to. The pipes' slots count against the user's
+    /// `/proc/sys/fs/pipe-user-pages-soft`. An unprivileged daemon with many
+    /// workers serving large READs can reach that limit, and from then on
+    /// every new pipe of that user gets two slots. `AsyncFuseServing` and the
+    /// io_uring queues of `UringFuseServing` don't splice.
+    pub fn set_splice_write(&mut self, splice: bool) {
+        self.splice_write = splice;
     }
 
     /// Set fusermount binary, default to fusermount3.
@@ -325,7 +344,7 @@ impl FuseSession {
             let file = file
                 .try_clone()
                 .map_err(|e| SessionFailure(format!("dup fd: {e}")))?;
-            let channel = FuseChannel::new(file, self.bufsize)?;
+            let channel = FuseChannel::new(file, self.bufsize, self.splice_pipes())?;
             let waker = channel.get_waker();
             self.add_waker(waker)?;
 
@@ -346,7 +365,20 @@ impl FuseSession {
     /// Requires kernel support for `FUSE_DEV_IOC_CLONE` (kernel >= 4.2).
     pub fn new_blocking_channel(&self) -> Result<BlockingFuseChannel> {
         let file = self.clone_fuse_file()?;
-        Ok(BlockingFuseChannel::new(file, self.bufsize))
+        Ok(BlockingFuseChannel::new(
+            file,
+            self.bufsize,
+            self.splice_pipes(),
+        ))
+    }
+
+    fn splice_pipes(&self) -> Option<SplicePipes> {
+        if !self.splice_write {
+            return None;
+        }
+        SplicePipes::new()
+            .inspect_err(|e| warn!("fuse: can't create splice pipes, copying READ replies: {e}"))
+            .ok()
     }
 
     /// Wake channel loop and exit
@@ -398,10 +430,11 @@ pub struct FuseChannel {
     waker: Arc<Waker>,
     buf: Vec<u8>,
     events: Events,
+    splice: Option<SplicePipes>,
 }
 
 impl FuseChannel {
-    fn new(file: File, bufsize: usize) -> Result<Self> {
+    fn new(file: File, bufsize: usize, splice: Option<SplicePipes>) -> Result<Self> {
         let poll = Poll::new().map_err(|e| SessionFailure(format!("epoll create: {e}")))?;
         let waker = Waker::new(poll.registry(), EXIT_FUSE_EVENT)
             .map_err(|e| SessionFailure(format!("epoll register session fd: {e}")))?;
@@ -467,6 +500,7 @@ impl FuseChannel {
             waker,
             buf: vec![0x0u8; bufsize],
             events: Events::with_capacity(POLL_EVENTS_CAPACITY),
+            splice,
         })
     }
 
@@ -529,7 +563,9 @@ impl FuseChannel {
                         // Reader::new() and Writer::new() should always return success.
                         let reader =
                             Reader::from_fuse_buffer(FuseBuf::new(&mut self.buf[..len])).unwrap();
-                        let writer = FuseDevWriter::new(fd, buf).unwrap();
+                        let writer = FuseDevWriter::new(fd, buf)
+                            .unwrap()
+                            .with_splice(self.splice.as_ref());
                         return Ok(Some((reader, writer)));
                     }
                     Err(e) => match e {
@@ -585,13 +621,15 @@ impl FuseChannel {
 pub struct BlockingFuseChannel {
     file: File,
     buf: Vec<u8>,
+    splice: Option<SplicePipes>,
 }
 
 impl BlockingFuseChannel {
-    fn new(file: File, bufsize: usize) -> Self {
+    fn new(file: File, bufsize: usize, splice: Option<SplicePipes>) -> Self {
         BlockingFuseChannel {
             file,
             buf: vec![0x0u8; bufsize],
+            splice,
         }
     }
 
@@ -620,7 +658,9 @@ impl BlockingFuseChannel {
                     // Reader::new() and Writer::new() should always return success.
                     let reader =
                         Reader::from_fuse_buffer(FuseBuf::new(&mut self.buf[..len])).unwrap();
-                    let writer = FuseDevWriter::new(fd, buf).unwrap();
+                    let writer = FuseDevWriter::new(fd, buf)
+                        .unwrap()
+                        .with_splice(self.splice.as_ref());
                     return Ok(Some((reader, writer)));
                 }
                 Err(e) => match e {
@@ -1246,7 +1286,7 @@ mod tests {
     #[test]
     fn test_new_channel() {
         let file = File::from(nix::unistd::dup(std::io::stdout()).unwrap());
-        let _ = FuseChannel::new(file, 3).unwrap();
+        let _ = FuseChannel::new(file, 3, None).unwrap();
     }
 
     #[test]

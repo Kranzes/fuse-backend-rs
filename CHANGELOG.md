@@ -103,6 +103,14 @@
   when `FsOptions::SUBMOUNTS` is in `VfsOptions::out_opts` and the kernel offers
   it, as virtio-fs does since Linux 5.10, so each mount gets its own `st_dev`.
   Otherwise `Vfs` clears `ATTR_SUBMOUNT` from the entries of its file systems.
+- [371](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/371): `FuseSession::set_splice_write()` makes the Linux
+  channels send READ replies with `splice(2)` when the file system serves the
+  data from a file through `ZeroCopyWriter::write_from()`, as `PassthroughFs`
+  does, so the data goes from the page cache into the FUSE request without a
+  copy through the server. `FileReadWriteVolatile::raw_fd()` gives the
+  transport the file descriptor. A channel falls back to copying when the
+  kernel can't splice. It's off by default, because the pipes count against
+  the user's `pipe-user-pages-soft`.
 - [304](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/304): Give FreeBSD a verification path. The Linux wire-format ABI
 - [NNN](link): `VfsOptions::pseudo_dir_mode`, `pseudo_dir_uid` and `pseudo_dir_gid` set the
   permission bits, owner and group of the directories `Vfs` serves itself: its root while no file
