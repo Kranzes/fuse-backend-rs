@@ -52,6 +52,9 @@
   Both default to `ENOSYS`, after which the kernel uses `GETATTR` for the rest of the connection.
   `Vfs` passes them on, and answers with `getattr()` for the pseudo file system and for backends
   without `statx()`. `PassthroughFs` serves them with the host `statx()` on Linux.
+- [335](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/335): `FileSystem::tmpfile()` serves `FUSE_TMPFILE` (protocol 7.37, Linux 6.1), which
+  the kernel sends for an `open(2)` with `O_TMPFILE`, in both servers. It defaults to `ENOSYS`.
+  `Vfs` passes it on, and `PassthroughFs` serves it with `openat(O_TMPFILE)` on Linux.
 - [304](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/304): Give FreeBSD a verification path. The Linux wire-format ABI
 - [NNN](link): `VfsOptions::pseudo_dir_mode`, `pseudo_dir_uid` and `pseudo_dir_gid` set the
   permission bits, owner and group of the directories `Vfs` serves itself: its root while no file
