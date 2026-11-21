@@ -394,6 +394,10 @@
 - [321](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/321): A standalone `OverlayFs` negotiates `FsOptions::CREATE_SUPP_GROUP` like
   `PassthroughFs`. Without it the kernel didn't send the daemon the caller's supplementary group,
   so a create in a directory that only that group may write to failed with `EACCES`.
+- [NNN](link): io_uring reads and writes on a descriptor from `async_file::File::borrow_fd()` no
+  longer leak 56 bytes each. `PassthroughFs` serves every async read and write that way. Such an
+  operation also keeps the descriptor's guard until the kernel completes it, even if its future is
+  dropped first.
 - [303](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/303): The sync server answers a SETXATTR request it received in full
   but cannot decode — no NUL separator in the attribute name, or a value size
   that disagrees with the body — with `EINVAL` instead of dropping it. FUSE
