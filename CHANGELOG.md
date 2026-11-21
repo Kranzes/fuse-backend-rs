@@ -283,6 +283,9 @@
   io_uring close operation.
 - [339](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/339): `fuse-backend-core` no longer enables vm-memory's unused `backend-mmap` feature,
   which doesn't build on FreeBSD. A crate that uses vm-memory's mmap types has to enable it itself.
+- [341](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/341): The Linux and FreeBSD INIT reply advertises protocol 7.46
+  instead of 7.33. Neither kernel behaves differently above 7.33, and the
+  server answers the newer opcodes it doesn't handle with ENOSYS.
 - [294](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/294): `PassthroughFs` negotiates
   `FsOptions::DIRECT_IO_ALLOW_MMAP` under the `Never` and `Metadata` cache policies only when the
   new `Config::allow_mmap` opts in (default off), so shared mmaps keep failing with `ENODEV` there

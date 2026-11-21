@@ -2012,6 +2012,16 @@ mod tests {
         serve_bytes(server, opcode, nodeid, body.as_slice()).await
     }
 
+    /// Like `serve()`, for opcodes that `Opcode` doesn't name.
+    async fn serve_opcode<T: ByteValued>(
+        server: &Server<DirFs>,
+        opcode: u32,
+        nodeid: u64,
+        body: T,
+    ) -> Vec<u8> {
+        serve_raw(server, opcode, nodeid, body.as_slice()).await
+    }
+
     /// Like `serve()`, with the request body in `body`.
     async fn serve_bytes(
         server: &Server<DirFs>,
@@ -2218,6 +2228,18 @@ mod tests {
         let reply = serve(&server, Opcode::Releasedir, 1, release_in).await;
         assert_eq!(server.fs.calls(), (3, 3));
         assert_eq!(reply_error(&reply), -libc::EBADF);
+    }
+
+    #[tokio::test]
+    async fn test_async_newer_opcodes_get_enosys() {
+        // SYNCFS, TMPFILE, STATX and COPY_FILE_RANGE_64.
+        let server = Server::new(DirFs::default());
+        for opcode in 50..=53 {
+            let reply = serve_opcode(&server, opcode, 1, [0u64; 8]).await;
+            assert_eq!(reply.len(), size_of::<OutHeader>(), "opcode {}", opcode);
+            assert_eq!(reply_error(&reply), -libc::ENOSYS, "opcode {}", opcode);
+        }
+        assert_eq!(server.fs.calls(), (0, 0));
     }
 
     #[tokio::test]
