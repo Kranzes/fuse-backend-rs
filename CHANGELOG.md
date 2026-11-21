@@ -111,6 +111,15 @@
   transport the file descriptor. A channel falls back to copying when the
   kernel can't splice. It's off by default, because the pipes count against
   the user's `pipe-user-pages-soft`.
+- [373](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/373): `FuseSession::set_splice_write()` applies to
+  `AsyncFuseServing` too, and `FuseDevTask::set_splice_write()` turns it on
+  for a task made by hand. Each request buffer creates two pipes on its first
+  splice and keeps them, so a worker can hold `max_inflight` pairs against
+  `pipe-user-pages-soft`, up to 128 pages each for READs of 128 KiB.
+  `AsyncZeroCopyWriter::async_write_from()` splices on the tokio runtime,
+  where the read it replaces blocks the runtime thread too, and reads with
+  io_uring on tokio-uring. `AsyncFileReadWriteVolatile::raw_fd()` gives the
+  transport the file descriptor.
 - [304](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/304): Give FreeBSD a verification path. The Linux wire-format ABI
 - [NNN](link): `VfsOptions::pseudo_dir_mode`, `pseudo_dir_uid` and `pseudo_dir_gid` set the
   permission bits, owner and group of the directories `Vfs` serves itself: its root while no file

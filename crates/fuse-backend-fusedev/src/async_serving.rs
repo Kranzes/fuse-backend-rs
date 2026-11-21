@@ -89,6 +89,7 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> AsyncFuseServing<F> {
         let workers = cfg.workers.max(1);
         let max_inflight = cfg.max_inflight;
         let buf_size = session.bufsize();
+        let splice_write = session.splice_write();
 
         // Clone one file description per worker up front, so cloning
         // failures are reported before any thread is spawned. Each worker
@@ -139,6 +140,7 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> AsyncFuseServing<F> {
                             }
                         };
                         task.report_activity(exited.activity().clone());
+                        task.set_splice_write(splice_write);
                         guard.ready();
                         runtime.block_on(task.poll_handler());
                     }
