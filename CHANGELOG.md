@@ -91,6 +91,9 @@
   `Config::allow_idmap` is set; behind a `Vfs`, add it to
   `VfsOptions::out_opts`. `OverlayFs` has its own `Config::allow_idmap`.
 
+- [366](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/366): `Server::set_max_background()`, `Server::set_congestion_threshold()` and
+  `Server::set_max_readahead()` set the background request limits and the
+  readahead of the INIT reply. The defaults keep the values sent before.
 - [304](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/304): Give FreeBSD a verification path. The Linux wire-format ABI
 - [NNN](link): `VfsOptions::pseudo_dir_mode`, `pseudo_dir_uid` and `pseudo_dir_gid` set the
   permission bits, owner and group of the directories `Vfs` serves itself: its root while no file
