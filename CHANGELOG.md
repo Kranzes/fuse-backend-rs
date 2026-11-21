@@ -94,6 +94,10 @@
 - [366](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/366): `Server::set_max_background()`, `Server::set_congestion_threshold()` and
   `Server::set_max_readahead()` set the background request limits and the
   readahead of the INIT reply. The defaults keep the values sent before.
+- [NNN](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/NNN): `Vfs` marks the root of each mounted file system with `ATTR_SUBMOUNT`
+  when `FsOptions::SUBMOUNTS` is in `VfsOptions::out_opts` and the kernel offers
+  it, as virtio-fs does since Linux 5.10, so each mount gets its own `st_dev`.
+  Otherwise `Vfs` clears `ATTR_SUBMOUNT` from the entries of its file systems.
 - [304](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/304): Give FreeBSD a verification path. The Linux wire-format ABI
 - [NNN](link): `VfsOptions::pseudo_dir_mode`, `pseudo_dir_uid` and `pseudo_dir_gid` set the
   permission bits, owner and group of the directories `Vfs` serves itself: its root while no file
@@ -468,6 +472,14 @@
 - [329](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/329): The servers no longer reply to NOTIFY_REPLY. The kernel takes no reply to it, and
   sends it under the unique number that the server picked for NOTIFY_RETRIEVE, so a reply could
   end another request.
+- [NNN](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/NNN): `Vfs` applies the id mapping to the root entry of a mounted file
+  system once. LOOKUP applied it a second time, so with a mapping whose ranges
+  overlap, such as (0, 1, 65536), LOOKUP and READDIRPLUS disagreed about the
+  owner of the mount root.
+- [NNN](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/NNN): CREATE replies carry the `attr_flags` of the file system's `Entry`, like
+  the other replies with an entry. Both servers sent 0, so a file created on a
+  virtio-fs mount with per-file DAX got DAX only after the kernel evicted its
+  inode and looked it up again.
 - [329](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/329): The servers no longer reply to NOTIFY_REPLY when `FileSystem::notify_reply()`
   fails, which the default implementation does. The kernel takes no reply to NOTIFY_REPLY, and
   sends it under the unique number that the server picked for NOTIFY_RETRIEVE, so the reply
