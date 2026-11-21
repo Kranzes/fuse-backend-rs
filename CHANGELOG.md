@@ -40,6 +40,13 @@
 - [331](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/331): `Server::notify_poll_wakeup()` wakes the poll(2) calls that wait for a file. It
   takes the kernel handle that `FileSystem::poll()` gets along with `POLL_SCHEDULE_NOTIFY`. `Vfs`
   passes POLL requests on to the mounted file systems.
+- [332](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/332): Fuzz the request server. The `server` and `async_server` targets under `fuzz/`
+  feed arbitrary requests to `handle_message()` and `async_handle_message()`. They check that
+  the server doesn't panic, that a request taking no reply gets none, and that every other
+  request gets exactly one well formed reply. The harness lives in the `fuzz/common` crate,
+  whose tests check the seeds, replay the inputs in `fuzz/regressions` and run a short mutation
+  loop on stable. A new `Fuzz` CI job runs those tests, and on pull requests also runs each
+  target for five minutes on nightly.
 - [304](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/304): Give FreeBSD a verification path. The Linux wire-format ABI
 - [NNN](link): `VfsOptions::pseudo_dir_mode`, `pseudo_dir_uid` and `pseudo_dir_gid` set the
   permission bits, owner and group of the directories `Vfs` serves itself: its root while no file
