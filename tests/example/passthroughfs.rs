@@ -31,8 +31,8 @@ pub struct Daemon<F: FileSystem + Send + Sync = Vfs> {
 impl Daemon {
     /// Creates a fusedev daemon instance
     pub fn new(src: &str, mountpoint: &str, thread_cnt: u32) -> Result<Self> {
-        // The macOS e2e test exercises the xattr family through the mount;
-        // on Linux the config stays at the historical default.
+        // For the xattr steps of the macOS e2e test, skipped on fuse-t.
+        // On Linux the config stays at the historical default.
         Self::with_options(
             src,
             mountpoint,
