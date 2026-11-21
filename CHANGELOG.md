@@ -37,6 +37,9 @@
   `FsOptions::HAS_EXPIRE_ONLY`, which `Vfs` now negotiates), `notify_increment_epoch()` (Linux
   6.16) and `notify_prune()` (Linux 6.17). `Vfs` passes NOTIFY_REPLY on to the mounted file
   system.
+- [331](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/331): `Server::notify_poll_wakeup()` wakes the poll(2) calls that wait for a file. It
+  takes the kernel handle that `FileSystem::poll()` gets along with `POLL_SCHEDULE_NOTIFY`. `Vfs`
+  passes POLL requests on to the mounted file systems.
 - [304](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/304): Give FreeBSD a verification path. The Linux wire-format ABI
 - [NNN](link): `VfsOptions::pseudo_dir_mode`, `pseudo_dir_uid` and `pseudo_dir_gid` set the
   permission bits, owner and group of the directories `Vfs` serves itself: its root while no file
