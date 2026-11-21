@@ -257,6 +257,10 @@
   still works and makes an idle task check the flag every 100ms. `AsyncFuseServing` and the
   `/dev/fuse` thread of `UringFuseServing::new_async()` stop with a signal, so their idle tasks
   no longer wake 10 times a second.
+- [337](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/337): The passthrough test daemon takes `--serving sync|async|uring`, `--runtime
+  tokio|uring`, `--no-writeback` and `--kernel-passthrough`. CI also runs xfstests with
+  `SyncFuseServing`, with `AsyncFuseServing` on tokio and on tokio-uring, with
+  `UringFuseServing`, without the writeback cache and with kernel passthrough.
 
 ### Changed
 - [330](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/330): `FileSystem::notify_reply()` takes the retrieved data and returns nothing, which
