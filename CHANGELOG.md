@@ -320,6 +320,13 @@
   `mount(2)` or fusermount as before. With `set_target_mntns()`, a helper thread mounts and
   unmounts in that namespace, so root no longer needs nsenter and fusermount there.
   `auto_unmount` still takes fusermount.
+- [NNN](link): `UringConfig::defer_taskrun` makes the workers of `UringFuseServing::new()`
+  create their rings with `IORING_SETUP_SINGLE_ISSUER` and `IORING_SETUP_DEFER_TASKRUN`, so the
+  kernel copies requests into their entries when they wait for the next one instead of
+  interrupting their handlers. On Linux 7.3.1, that made stats and 4 KiB reads that a client
+  sends one at a time faster. It is off by default, because Linux 7.2.0-7.2.13 and 7.3.0-7.3.1
+  can miss the wake-up of a worker waiting on such a ring. `new_async()` ignores it.
+  `UringConfig` has a new field.
 
 ### Changed
 - [330](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/330): `FileSystem::notify_reply()` takes the retrieved data and returns nothing, which
