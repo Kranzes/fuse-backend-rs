@@ -6098,11 +6098,13 @@ mod tests {
             }
         }
         let _release = Release(fs.clone());
-        let abort = ConnectionAbort::new(serving.session.mountpoint());
-        let Some(waiting) = abort.path.as_ref().map(|p| p.with_file_name("waiting")) else {
+        let abort = ConnectionAbort::new(&serving.session);
+        if abort.file.is_err() {
             eprintln!("fusectl isn't mounted, skipping");
             return;
-        };
+        }
+        let minor = mount_minor_at(serving.session.mountpoint()).unwrap();
+        let waiting = format!("/sys/fs/fuse/connections/{minor}/waiting");
         // The number of requests the kernel waits for.
         let waiting = move || -> usize {
             let n = std::fs::read_to_string(&waiting).unwrap();
