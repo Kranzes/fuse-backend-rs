@@ -62,6 +62,13 @@
   stops all of them. `gmake check-freebsd` also lints and tests fusedev, and
   as root its tests mount a file system.
 
+- [342](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/342): Support `FsOptions::SETXATTR_EXT` on Linux and FreeBSD. The
+  server reads the flags of the extended setxattr request into the new
+  `Context::setxattr_flags`, on `/dev/fuse` and on io_uring. `PassthroughFs`
+  negotiates it and clears the set-group-ID bit before it sets
+  `system.posix_acl_access` when the kernel sends `SETXATTR_ACL_KILL_SGID`.
+  `Vfs` passes the flags to its backends but leaves the option out of its
+  default `out_opts`.
 - [304](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/304): Give FreeBSD a verification path. The Linux wire-format ABI
 - [NNN](link): `VfsOptions::pseudo_dir_mode`, `pseudo_dir_uid` and `pseudo_dir_gid` set the
   permission bits, owner and group of the directories `Vfs` serves itself: its root while no file
