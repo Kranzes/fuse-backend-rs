@@ -79,6 +79,13 @@
   kernel stops sending it. `Vfs` syncs every mounted backend when asked for its
   root, and `PassthroughFs` calls `syncfs(2)` on the shared directory.
   `Opcode::MaxOpcode` moves to 51.
+- [345](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/345): Add `FsOptions::ALLOW_IDMAP` (Linux 6.12 and later), which
+  lets the FUSE mount be idmapped with `mount_setattr(MOUNT_ATTR_IDMAP)`.
+  `PassthroughFs` negotiates it on its own when the new
+  `Config::allow_idmap` is set; behind a `Vfs`, add it to
+  `VfsOptions::out_opts`. `OverlayFs` isn't ready for it: it copies files
+  up with the ids of the request, which are then invalid.
+
 - [304](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/304): Give FreeBSD a verification path. The Linux wire-format ABI
 - [NNN](link): `VfsOptions::pseudo_dir_mode`, `pseudo_dir_uid` and `pseudo_dir_gid` set the
   permission bits, owner and group of the directories `Vfs` serves itself: its root while no file

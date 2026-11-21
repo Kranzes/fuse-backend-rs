@@ -249,6 +249,14 @@ const PASSTHROUGH: u64 = 1_u64 << 37;
 // this flag indicates whether the guest kernel enable resend
 const HAS_RESEND: u64 = 1_u64 << 39;
 
+// The file system can be mounted idmapped (protocol 7.41)
+const ALLOW_IDMAP: u64 = 1_u64 << 40;
+
+/// The uid and gid of a request on a connection with `FsOptions::ALLOW_IDMAP`, except in the
+/// requests that create an inode: mknod, mkdir, symlink, create, tmpfile and rename2 with
+/// `RENAME_WHITEOUT`.
+pub const FUSE_INVALID_UIDGID: u32 = u32::MAX;
+
 // The kernel aborts the connection when a request waits longer than the
 // request_timeout of the INIT reply (protocol 7.43)
 const REQUEST_TIMEOUT: u64 = 1_u64 << 42;
@@ -550,6 +558,12 @@ bitflags! {
         /// file with `fuse_backing_open()` and return its id from `open` along with
         /// `OpenOptions::PASSTHROUGH`.
         const PASSTHROUGH = PASSTHROUGH;
+
+        /// Allow idmapped mounts of the file system (protocol 7.41). The kernel then sends
+        /// `FUSE_INVALID_UIDGID` as the ids of most requests, and fails INIT without the
+        /// `default_permissions` mount option. `mount_setattr(MOUNT_ATTR_IDMAP)` fails with
+        /// `EINVAL` until the kernel has the INIT reply, which any request to the mount waits for.
+        const ALLOW_IDMAP = ALLOW_IDMAP;
 
         /// Daemon supports serving FUSE requests over io_uring (experimental).
         #[cfg(feature = "fusedev-uring")]
