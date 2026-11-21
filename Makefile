@@ -46,14 +46,14 @@ check: build
 	${CARGO} clippy ${TARGET} --features="virtiofs,async-io" --no-default-features -- -Dwarnings
 	${CARGO} clippy ${TARGET} --features="vhost-user-fs,async-io" --no-default-features -- -Dwarnings
 	${CARGO} clippy ${TARGET} --features="fusedev,virtiofs,async-io" --no-default-features -- -Dwarnings
-	${CARGO} clippy ${TARGET} -p fuse-backend-core --no-default-features -- -Dwarnings
-	${CARGO} clippy ${TARGET} -p fuse-backend-core --no-default-features --features="async-io" -- -Dwarnings
-	# The async-io test binaries that fix the process-global runtime type run
-	# in binaries of their own; lint them explicitly. `--all-targets` would
-	# also lint the in-crate unit tests, which still carry lint debt.
-	${CARGO} clippy ${TARGET} -p fuse-backend-core --no-default-features --features="async-io" --test runtime_type -- -Dwarnings
-	${CARGO} clippy ${TARGET} -p fuse-backend-fusedev --no-default-features --features="fuse-backend-fusedev/async-io" --test tokio_runtime -- -Dwarnings
-	${CARGO} clippy ${TARGET} -p fuse-backend-core --no-default-features --features="fusedev-uring" -- -Dwarnings
+	# `--all-targets` lints the unit tests and the tests/ binaries too.
+	${CARGO} clippy ${TARGET} -p fuse-backend-core --no-default-features --all-targets -- -Dwarnings
+	${CARGO} clippy ${TARGET} -p fuse-backend-core --no-default-features --features="async-io" --all-targets -- -Dwarnings
+	${CARGO} clippy ${TARGET} -p fuse-backend-core --no-default-features --features="fusedev-uring" --all-targets -- -Dwarnings
+	${CARGO} clippy ${TARGET} -p fuse-backend-fusedev --no-default-features --all-targets -- -Dwarnings
+	${CARGO} clippy ${TARGET} -p fuse-backend-fusedev --no-default-features --features="fuse-backend-fusedev/async-io" --all-targets -- -Dwarnings
+	${CARGO} clippy ${TARGET} -p fuse-backend-fusedev --no-default-features --features="fuse-backend-fusedev/uring" --all-targets -- -Dwarnings
+	${CARGO} clippy ${TARGET} -p fuse-backend-fusedev --no-default-features --features="fuse-backend-fusedev/uring,fuse-backend-fusedev/async-io" --all-targets -- -Dwarnings
 	# `Vfs` used to be clippy'd as part of core (the rows above); now that it is
 	# its own crate, restore the same no-default + async-io lib coverage.
 	# `persist` is deliberately excluded here: dbs-snapshot does not cross-compile
@@ -140,9 +140,9 @@ check-macos: build-macos
 	${CARGO} test --features="fusedev,fuse-t" -- --nocapture --skip integration
 	${CARGO} clippy --features="fusedev,async-io" -- -Dwarnings
 	${CARGO} test --features="fusedev,async-io" -- --nocapture --skip integration
-	${CARGO} clippy -p fuse-backend-core --no-default-features -- -Dwarnings
+	${CARGO} clippy -p fuse-backend-core --no-default-features --all-targets -- -Dwarnings
 	${CARGO} test -p fuse-backend-core --no-default-features -- --nocapture --skip integration
-	${CARGO} clippy -p fuse-backend-core --no-default-features --features="async-io" -- -Dwarnings
+	${CARGO} clippy -p fuse-backend-core --no-default-features --features="async-io" --all-targets -- -Dwarnings
 	${CARGO} test -p fuse-backend-core --no-default-features --features="async-io" -- --nocapture --skip integration
 	${CARGO} clippy -p fuse-backend-vfs --no-default-features -- -Dwarnings
 	${CARGO} test -p fuse-backend-vfs --no-default-features -- --nocapture --skip integration
@@ -156,7 +156,9 @@ check-macos: build-macos
 	# is a Linux-only crate. The passthrough crate now builds on macOS (the
 	# unported operations answer ENOSYS in the os seams), so it gets its own
 	# clippy and test rows above.
+	${CARGO} clippy -p fuse-backend-fusedev --no-default-features --all-targets -- -Dwarnings
 	${CARGO} test -p fuse-backend-fusedev --no-default-features -- --nocapture --skip integration
+	${CARGO} clippy -p fuse-backend-fusedev --features="fuse-backend-fusedev/fuse-t" --all-targets -- -Dwarnings
 	${CARGO} test -p fuse-backend-fusedev --features="fuse-backend-fusedev/fuse-t" -- --nocapture --skip integration
 
 smoke-macos: check-macos

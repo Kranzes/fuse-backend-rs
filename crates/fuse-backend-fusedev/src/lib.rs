@@ -703,10 +703,10 @@ mod tests {
         assert_eq!(reader.available_bytes(), 106);
         assert_eq!(reader.bytes_read(), 0);
 
-        let mut buffer = [0 as u8; 64];
-        if let Err(_) = reader.read_exact(&mut buffer) {
-            panic!("read_exact should not fail here");
-        }
+        let mut buffer = [0u8; 64];
+        reader
+            .read_exact(&mut buffer)
+            .expect("read_exact should not fail here");
 
         assert_eq!(reader.available_bytes(), 42);
         assert_eq!(reader.bytes_read(), 64);
@@ -730,16 +730,16 @@ mod tests {
         assert_eq!(writer.available_bytes(), 106);
         assert_eq!(writer.bytes_written(), 0);
 
-        let mut buffer = [0 as u8; 64];
-        if let Err(_) = writer.write_all(&mut buffer) {
-            panic!("write_all should not fail here");
-        }
+        let buffer = [0u8; 64];
+        writer
+            .write_all(&buffer)
+            .expect("write_all should not fail here");
 
         assert_eq!(writer.available_bytes(), 42);
         assert_eq!(writer.bytes_written(), 64);
 
-        let mut buffer = [0 as u8; 42];
-        match writer.write(&mut buffer) {
+        let buffer = [0u8; 42];
+        match writer.write(&buffer) {
             Err(_) => panic!("write should not fail here"),
             Ok(length) => assert_eq!(length, 42),
         }
@@ -760,16 +760,16 @@ mod tests {
         assert_eq!(writer2.available_bytes(), 2);
         assert_eq!(writer2.bytes_written(), 0);
 
-        let mut buffer = [0 as u8; 64];
-        if let Err(_) = writer.write_all(&mut buffer) {
-            panic!("write_all should not fail here");
-        }
+        let buffer = [0u8; 64];
+        writer
+            .write_all(&buffer)
+            .expect("write_all should not fail here");
 
         assert_eq!(writer.available_bytes(), 42);
         assert_eq!(writer.bytes_written(), 64);
 
-        let mut buffer = [0 as u8; 42];
-        match writer.write(&mut buffer) {
+        let buffer = [0u8; 42];
+        match writer.write(&buffer) {
             Err(_) => panic!("write should not fail here"),
             Ok(length) => assert_eq!(length, 42),
         }
@@ -783,8 +783,7 @@ mod tests {
         let mut buf = [0u8; 106];
         let mut reader = Reader::<()>::from_fuse_buffer(FuseBuf::new(&mut buf)).unwrap();
 
-        let mut buf2 = Vec::with_capacity(1024);
-        buf2.resize(1024, 0);
+        let mut buf2 = vec![0; 1024];
 
         assert_eq!(
             reader
@@ -810,9 +809,10 @@ mod tests {
         let mut buf = [0u8; 128];
         let mut reader = Reader::<()>::from_fuse_buffer(FuseBuf::new(&mut buf)).unwrap();
 
-        if let Ok(_) = reader.split_at(256) {
-            panic!("successfully split Reader with out of bounds offset");
-        }
+        assert!(
+            reader.split_at(256).is_err(),
+            "successfully split Reader with out of bounds offset"
+        );
     }
 
     #[test]
@@ -824,11 +824,11 @@ mod tests {
         writer.buffered = true;
         assert_eq!(writer.available_bytes(), 106);
 
-        writer.write(&[0x1u8; 4]).unwrap();
+        assert_eq!(writer.write(&[0x1u8; 4]).unwrap(), 4);
         assert_eq!(writer.available_bytes(), 102);
         assert_eq!(writer.bytes_written(), 4);
 
-        let buf = vec![0xdeu8; 64];
+        let buf = [0xdeu8; 64];
         let slices = [
             IoSlice::new(&buf[..32]),
             IoSlice::new(&buf[32..48]),
@@ -855,11 +855,11 @@ mod tests {
         assert_eq!(writer.available_bytes(), 4);
         assert_eq!(other.available_bytes(), 102);
 
-        writer.write(&[0x1u8; 4]).unwrap();
+        assert_eq!(writer.write(&[0x1u8; 4]).unwrap(), 4);
         assert_eq!(writer.available_bytes(), 0);
         assert_eq!(writer.bytes_written(), 4);
 
-        let buf = vec![0xdeu8; 64];
+        let buf = [0xdeu8; 64];
         let slices = [
             IoSlice::new(&buf[..32]),
             IoSlice::new(&buf[32..48]),
@@ -886,11 +886,11 @@ mod tests {
         assert_eq!(writer.available_bytes(), 4);
         assert_eq!(other.available_bytes(), 102);
 
-        writer.write(&[0x1u8; 4]).unwrap();
+        assert_eq!(writer.write(&[0x1u8; 4]).unwrap(), 4);
         assert_eq!(writer.available_bytes(), 0);
         assert_eq!(writer.bytes_written(), 4);
 
-        let buf = vec![0xdeu8; 64];
+        let buf = [0xdeu8; 64];
         let slices = [
             IoSlice::new(&buf[..32]),
             IoSlice::new(&buf[32..48]),
@@ -910,7 +910,7 @@ mod tests {
     fn read_full() {
         let mut buf2 = [0u8; 48];
         let mut reader = Reader::<()>::from_fuse_buffer(FuseBuf::new(&mut buf2)).unwrap();
-        let mut buf = vec![0u8; 64];
+        let mut buf = [0u8; 64];
 
         assert_eq!(
             reader.read(&mut buf[..]).expect("failed to read to buffer"),
@@ -924,10 +924,10 @@ mod tests {
         let mut buf = vec![0x0u8; 48];
         let mut writer = FuseDevWriter::<()>::new(file.as_raw_fd(), &mut buf).unwrap();
 
-        let buf = vec![0xdeu8; 64];
+        let buf = [0xdeu8; 64];
         writer.write(&buf[..]).unwrap_err();
 
-        let buf = vec![0xdeu8; 48];
+        let buf = [0xdeu8; 48];
         assert_eq!(
             writer.write(&buf[..]).expect("failed to write from buffer"),
             48
@@ -940,7 +940,7 @@ mod tests {
         let mut buf = vec![0x0u8; 48];
         let mut writer = FuseDevWriter::<()>::new(file.as_raw_fd(), &mut buf).unwrap();
 
-        let buf = vec![0xdeu8; 48];
+        let buf = [0xdeu8; 48];
         let slices = [
             IoSlice::new(&buf[..32]),
             IoSlice::new(&buf[32..40]),
@@ -1143,14 +1143,14 @@ mod tests {
             let fd = file.as_raw_fd();
             let mut buf = vec![0x0u8; 48];
             let mut writer = FuseDevWriter::<()>::new(fd, &mut buf).unwrap();
-            let buf = vec![0xdeu8; 64];
+            let buf = [0xdeu8; 64];
             let res = async_runtime::block_on(async { writer.async_write(&buf[..]).await });
             assert!(res.is_err());
 
             let fd = file.as_raw_fd();
             let mut buf = vec![0x0u8; 48];
             let mut writer2 = FuseDevWriter::<()>::new(fd, &mut buf).unwrap();
-            let buf = vec![0xdeu8; 48];
+            let buf = [0xdeu8; 48];
             let res = async_runtime::block_on(async { writer2.async_write(&buf[..]).await });
             assert_eq!(res.unwrap(), 48);
         }
@@ -1161,7 +1161,7 @@ mod tests {
             let fd = file.as_raw_fd();
             let mut buf = vec![0x0u8; 48];
             let mut writer = FuseDevWriter::<()>::new(fd, &mut buf).unwrap();
-            let buf = vec![0xdeu8; 48];
+            let buf = [0xdeu8; 48];
             let res = async_runtime::block_on(async {
                 writer.async_write2(&buf[..32], &buf[32..]).await
             });
@@ -1174,7 +1174,7 @@ mod tests {
             let fd = file.as_raw_fd();
             let mut buf = vec![0x0u8; 48];
             let mut writer = FuseDevWriter::<()>::new(fd, &mut buf).unwrap();
-            let buf = vec![0xdeu8; 48];
+            let buf = [0xdeu8; 48];
             let res = async_runtime::block_on(async {
                 writer
                     .async_write3(&buf[..32], &buf[32..40], &buf[40..])
@@ -1221,7 +1221,7 @@ mod tests {
             let mut writer = FuseDevWriter::<()>::new(fd1, buf).unwrap();
             let mut w2 = writer.split_at(4).expect("failed to split Writer");
 
-            let res = async_runtime::block_on(async {
+            async_runtime::block_on(async {
                 let file = File::async_open(&path, true, false).await.unwrap();
                 // A first short read serves bytes [0..10), like an inline
                 // fast path delivering a partial chunk...
@@ -1233,7 +1233,6 @@ mod tests {
                 let n = w2.async_write_from_at(&file, 10, 10).await.unwrap();
                 assert_eq!(n, 10);
             });
-            let _ = res;
 
             assert_eq!(w2.bytes_written(), 20);
             // The split writer owns buf[4..], so the data landed at buf[4..24].
@@ -1253,11 +1252,11 @@ mod tests {
             assert_eq!(writer.available_bytes(), 4);
             assert_eq!(other.available_bytes(), 102);
 
-            writer.write(&[0x1u8; 4]).unwrap();
+            assert_eq!(writer.write(&[0x1u8; 4]).unwrap(), 4);
             assert_eq!(writer.available_bytes(), 0);
             assert_eq!(writer.bytes_written(), 4);
 
-            let buf = vec![0xdeu8; 64];
+            let buf = [0xdeu8; 64];
             let slices = [
                 IoSlice::new(&buf[..32]),
                 IoSlice::new(&buf[32..48]),
