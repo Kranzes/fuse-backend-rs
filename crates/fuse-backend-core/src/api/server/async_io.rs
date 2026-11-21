@@ -2764,7 +2764,9 @@ mod tests {
 
         let server = Server::new(DirFs::default());
         let (version, _) = server.init_state();
-        server.restore_init(version, FsOptions::SETXATTR_EXT);
+        server
+            .restore_init(version, FsOptions::SETXATTR_EXT)
+            .unwrap();
         let setxattr_in = SetxattrIn {
             size: XATTR_VALUE.len() as u32,
             flags: 0,
@@ -3427,7 +3429,9 @@ mod tests {
         }
         assert!(buf.iter().all(|&b| b == 0));
         let (version, options) = server.init_state();
-        server.restore_init(version, options | FsOptions::HAS_EXPIRE_ONLY);
+        server
+            .restore_init(version, options | FsOptions::HAS_EXPIRE_ONLY)
+            .unwrap();
         // The flags are EXPIRE_ONLY.
         assert_notifies(
             NotifyOpcode::InvalEntry,

@@ -2673,7 +2673,9 @@ mod tests {
             let server = Server::new(XattrFs::default());
             let in2: &[u8] = if ext {
                 let (version, _) = server.init_state();
-                server.restore_init(version, FsOptions::SETXATTR_EXT);
+                server
+                    .restore_init(version, FsOptions::SETXATTR_EXT)
+                    .unwrap();
                 setxattr_in2.as_slice()
             } else {
                 &[]
