@@ -1056,9 +1056,12 @@ impl<S: BitmapSlice + Send + Sync + 'static> AsyncFileSystem for PassthroughFs<S
 
         // A writer that prefers a file descriptor, such as a zero-copy reply
         // over io_uring, would copy what the inline read below or the thread
-        // pool reads through memory, so it gets the file right away.
+        // pool reads through memory, so it gets the file right away. Its read
+        // through the descriptor is native IO and enters the gate. It takes
+        // only the descriptor, so the file object needn't block.
         if w.prefers_fd() {
-            let file = self.async_file_from_data(&data, flags)?;
+            let _gate = IoGate::enter(&data, false).await;
+            let file = self.async_file_from_data(&data, flags, false)?;
             return w.async_write_from(file, size as usize, offset).await;
         }
 
