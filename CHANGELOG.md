@@ -400,8 +400,9 @@
   descriptor, blocking the thread, and fail with `EOPNOTSUPP` for a file without one. The
   server's copies do the same when called or first polled off the serving thread. Off the
   serving thread, zero-copy IO over a FUSE-over-io_uring ring with `IORING_SETUP_SINGLE_ISSUER`
-  fails with `EEXIST`, and zero-copy IO that moved there after it started aborts the process if
-  the ring refuses that thread's wait for it. `ZeroCopySource` uses `#[async_trait]` instead of
+  fails with `EEXIST`, and zero-copy IO that moved there after it started fails if the ring
+  refuses that thread's wait for it, and the transport waits for the operation before the reply.
+  `ZeroCopySource` uses `#[async_trait]` instead of
   `#[async_trait(?Send)]`, so its `async_write_to_file()` future is `Send`, and transports can
   implement the new `Writer::async_write_from_fd()`.
 - [NNN](link): While none of their requests waits for anything but its zero-copy operation on
