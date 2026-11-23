@@ -4338,6 +4338,8 @@ mod tests {
             idx: 0,
             slot: 0,
             bounce,
+            // Nothing reads them.
+            counts: Box::leak(Box::default()),
         }
     }
 
@@ -6575,12 +6577,14 @@ mod tests {
         };
         let state = RingState::new(ring, 2);
         let bounce = Mutex::new(BounceBuf::new(4096).unwrap());
+        let counts = ZeroCopyCounts::default();
         let io = |idx| ZeroCopyIo {
             state: &state,
             worker: current_thread(),
             idx,
             slot: 0,
             bounce: &bounce,
+            counts: &counts,
         };
         let (queued, other) = (io(0), io(1));
         let mut op = Box::pin(queued.run_async(opcode::Nop::new().build()));
