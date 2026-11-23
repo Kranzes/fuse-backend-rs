@@ -1454,7 +1454,17 @@ mod tests {
                 .unwrap()
         });
         umount2(&mountpoint, MntFlags::MNT_DETACH).unwrap();
-        assert_eq!(is_torn_down(se.get_fuse_file().unwrap()), !in_use);
+        let dev = se.get_fuse_file().unwrap();
+        if in_use {
+            assert!(!is_torn_down(dev));
+        } else {
+            // A child that another test forked during the mount keeps the connection up through its
+            // copies of the fsopen() and fsmount() descriptors until it execs or exits. The poll
+            // returns at the teardown.
+            let mut fds = [PollFd::new(dev.as_fd(), PollFlags::empty())];
+            assert_eq!(poll(&mut fds, PollTimeout::from(5000u16)), Ok(1));
+            assert_eq!(fds[0].revents(), Some(PollFlags::POLLERR));
+        }
         mount(
             Some("tmpfs"),
             &mountpoint,
