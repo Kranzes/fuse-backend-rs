@@ -436,7 +436,7 @@ mod splice {
         fn serve_async(se: FuseSession, fs: Arc<SpliceFs>) -> AsyncFuseServing<Arc<SpliceFs>> {
             let cfg = AsyncServingConfig {
                 workers: 1,
-                max_inflight: 0,
+                ..Default::default()
             };
             AsyncFuseServing::new(se, Arc::new(Server::new(fs)), cfg).unwrap()
         }
