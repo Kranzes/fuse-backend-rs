@@ -15,7 +15,7 @@ mod splice {
     use std::os::unix::io::{AsRawFd, RawFd};
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc::channel;
     use std::sync::Arc;
     use std::thread;
@@ -88,12 +88,16 @@ mod splice {
         file: Arc<File>,
         /// What `raw_fd()` returns, which the `SpliceFs` keeps open.
         fd: RawFd,
+        /// Whether the next call of `raw_fd()` doesn't count in `Stats::fd_calls`.
+        uncounted: AtomicBool,
         stats: Arc<Stats>,
     }
 
     impl ReadFile {
         fn fd(&self) -> Option<RawFd> {
-            self.stats.fd_calls.fetch_add(1, Ordering::Relaxed);
+            if !self.uncounted.swap(false, Ordering::Relaxed) {
+                self.stats.fd_calls.fetch_add(1, Ordering::Relaxed);
+            }
             Some(self.fd)
         }
     }
@@ -135,6 +139,7 @@ mod splice {
                     .as_ref()
                     .map_or(file.as_raw_fd(), |s| s.as_raw_fd()),
                 file,
+                uncounted: AtomicBool::new(false),
                 stats: self.stats.clone(),
             }
         }
@@ -427,7 +432,11 @@ mod splice {
                 if !self.async_write_from {
                     return self.read(ctx, inode, handle, w, size, offset, lock_owner, flags);
                 }
-                let file: Arc<dyn AsyncFileReadWriteVolatile> = Arc::new(self.read_file(inode));
+                let file = self.read_file(inode);
+                // The server asks for the descriptor of every file that `async_write_from()`
+                // copies, before the transport does.
+                file.uncounted.store(true, Ordering::Relaxed);
+                let file: Arc<dyn AsyncFileReadWriteVolatile> = Arc::new(file);
                 AssertSend(w.async_write_from(file, size as usize, offset)).await
             }
         }
