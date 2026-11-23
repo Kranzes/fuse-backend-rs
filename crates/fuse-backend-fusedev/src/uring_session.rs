@@ -6653,7 +6653,7 @@ mod tests {
         }
 
         fn stat(inode: u64) -> stat64 {
-            let mut st = super::barrier_fs::stat(inode);
+            let mut st = super::waiting_fs::stat(inode);
             st.st_size = 4096;
             st
         }
