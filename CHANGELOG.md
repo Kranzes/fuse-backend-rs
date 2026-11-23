@@ -324,9 +324,6 @@
   Each worker runs an async runtime and keeps up to one request per ring entry in flight, so
   handlers that wait don't hold up the worker's other requests.
   By default its queues get a pool buffer per entry, because a request keeps its buffer
-  while its handler waits. A worker lets its runtime park every 64 requests, so the timers and
-  tokio-uring IO that handlers wait for still run while requests keep coming.
-  Its queues get `entries_per_queue` pool buffers, because a request keeps its buffer
   while its handler waits.
 - [318](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/318): `UringFuseServing::new_async()` serves zero-copy too. `ZeroCopySource::async_write_to_file()`
   and `AsyncFileReadWriteVolatile::raw_fd()` let `Reader::async_read_to_at()` move zero-copy
