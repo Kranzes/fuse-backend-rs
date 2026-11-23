@@ -972,12 +972,11 @@ mod tests {
         if !file.uses_io_uring() {
             return;
         }
-        let mut mem = [0u8; 4];
 
         block_on(async {
-            // The pipe is empty, so the read stays in flight.
-            let mut read =
-                Box::pin(file.async_read_at(unsafe { FileVolatileBuf::new(&mut mem) }, 0));
+            // The pipe is empty, so the read stays in flight. It owns its buffer, so it may be
+            // dropped then.
+            let mut read = Box::pin(file.async_read_owned_at(vec![0u8; 4], 0));
             let pending =
                 std::future::poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx).is_pending()));
             assert!(pending.await);
@@ -996,7 +995,6 @@ mod tests {
             }
             assert_eq!(Arc::strong_count(&guard), 2);
         });
-        assert_eq!(&mem, b"test");
     }
 
     #[test]
