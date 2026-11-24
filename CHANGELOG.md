@@ -516,6 +516,13 @@
 - [362](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/362): `Vfs` answers a rename or a hard link between two of its mounts with EXDEV
   instead of EINVAL, as rename(2) and link(2) do between two file systems. `mv` copies the
   file only on EXDEV. On EINVAL it failed with "cannot move to a subdirectory of itself".
+- [363](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/363): `Vfs` no longer passes a mounted file system's ENOSYS on for requests that the
+  kernel then stops sending on the whole connection. One mount without fallocate or xattrs
+  turned them off for every mount, and one without fsync turned FSYNC off for the rest. `Vfs`
+  now answers what the kernel would answer the caller after ENOSYS: ENOTSUP for FALLOCATE and
+  the xattr requests, ENODATA for a POSIX ACL on Linux, and success for FLUSH, FSYNC, FSYNCDIR
+  and ACCESS. On Linux LINK gets EPERM and RENAME2 EINVAL. With `no_open`, FLUSH's ENOSYS
+  still goes to the kernel. The pseudo fs answers CREATE with EACCES.
 - [303](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/303): The sync server answers a SETXATTR request it received in full
   but cannot decode — no NUL separator in the attribute name, or a value size
   that disagrees with the body — with `EINVAL` instead of dropping it. FUSE
