@@ -109,6 +109,9 @@
   `Config::allow_idmap` is set; behind a `Vfs`, add it to
   `VfsOptions::out_opts`. `OverlayFs` has its own `Config::allow_idmap`.
 
+- [366](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/366): `Server::set_max_background()`, `Server::set_congestion_threshold()` and
+  `Server::set_max_readahead()` set the background request limits and the
+  readahead of the INIT reply. The defaults keep the values sent before.
 - [304](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/304): Give FreeBSD a verification path. The Linux wire-format ABI
   body moves out of `fuse_abi_linux.rs` into a shared `fuse_abi_wire.rs`
   (each per-OS prelude re-exports the libc names the body uses), and a new
