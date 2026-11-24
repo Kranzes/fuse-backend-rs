@@ -112,6 +112,10 @@
 - [366](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/366): `Server::set_max_background()`, `Server::set_congestion_threshold()` and
   `Server::set_max_readahead()` set the background request limits and the
   readahead of the INIT reply. The defaults keep the values sent before.
+- [367](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/367): `Vfs` marks the root of each mounted file system with `ATTR_SUBMOUNT`
+  when `FsOptions::SUBMOUNTS` is in `VfsOptions::out_opts` and the kernel offers
+  it, as virtio-fs does since Linux 5.10, so each mount gets its own `st_dev`.
+  Otherwise `Vfs` clears `ATTR_SUBMOUNT` from the entries of its file systems.
 - [304](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/304): Give FreeBSD a verification path. The Linux wire-format ABI
   body moves out of `fuse_abi_linux.rs` into a shared `fuse_abi_wire.rs`
   (each per-OS prelude re-exports the libc names the body uses), and a new
@@ -471,6 +475,14 @@
   longer leak 56 bytes each. `PassthroughFs` serves every async read and write that way. Such an
   operation also keeps the descriptor's guard until the kernel completes it, even if its future is
   dropped first.
+- [367](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/367): `Vfs` applies the id mapping to the root entry of a mounted file
+  system once. LOOKUP applied it a second time, so with a mapping whose ranges
+  overlap, such as (0, 1, 65536), LOOKUP and READDIRPLUS disagreed about the
+  owner of the mount root.
+- [367](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/367): CREATE replies carry the `attr_flags` of the file system's `Entry`, like
+  the other replies with an entry. Both servers sent 0, so a file created on a
+  virtio-fs mount with per-file DAX got DAX only after the kernel evicted its
+  inode and looked it up again.
 - [NNN](link): A `FuseDevTask` that keeps finding requests lets its runtime run. On tokio,
   `AsyncFd::ready()` takes none of the task's budget, and the read of a readable fuse fd doesn't
   wait, so a task that kept finding requests never returned to its runtime. The timers, IO and
