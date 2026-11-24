@@ -544,6 +544,7 @@
   or the tokio-uring runtime, the drop no longer waits until the files are closed. Without
   fusectl, the drop behaves as before.
 - [NNN](link): With `allow_direct_io` off, a create with O_DIRECT no longer opens the new host
+- [322](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/322): With `allow_direct_io` off, a create with O_DIRECT no longer opens the new host
   file with O_DIRECT, which made buffered IO on it fail with EINVAL. `PassthroughFs::create()`
   now builds the host open flags with the same helper as `open_inode()`.
 - [347](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/347): `Vfs` forwards COPY_FILE_RANGE to the mounted file system that holds both
