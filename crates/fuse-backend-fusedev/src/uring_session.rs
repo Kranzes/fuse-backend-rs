@@ -43,7 +43,7 @@ use std::time::{Duration, Instant};
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use vm_memory::ByteValued;
 
-use fuse_backend_core::abi::fuse_abi::{InHeader, Opcode, OutHeader, ReadIn};
+use fuse_backend_core::abi::fuse_abi::{FsOptions, InHeader, Opcode, OutHeader, ReadIn};
 use fuse_backend_core::abi::fuse_uring::{
     FuseUringBufpool, FuseUringCmdReq, FuseUringReqHeader, FUSE_IO_URING_CMD_ADD_BUFPOOL,
     FUSE_IO_URING_CMD_ADD_QUEUE, FUSE_IO_URING_CMD_COMMIT_AND_FETCH, FUSE_IO_URING_CMD_REGISTER,
@@ -274,7 +274,11 @@ fn spread_entries(
 /// area, so a size of 0 means a known opcode without a fixed header. Over a
 /// buffer pool, the kernel lends no buffer to a request without a payload
 /// and without out arguments. `None` marks opcodes this table doesn't know.
-fn op_args(opcode: u32) -> Option<(usize, bool)> {
+fn op_args(opcode: u32, setxattr_ext: bool) -> Option<(usize, bool)> {
+    // With SETXATTR_EXT, SetxattrIn2 follows SetxattrIn.
+    if setxattr_ext && opcode == Opcode::Setxattr as u32 {
+        return Some((16, false));
+    }
     // No wildcard arm, so that a new Opcode doesn't build without an entry.
     let args = match Opcode::from(opcode) {
         Opcode::Lookup => (0, true),                         // name only
@@ -1711,13 +1715,15 @@ impl UringEntry {
     /// entry's own or the one the kernel lent it, and the Reader reads it
     /// there. The writer puts the reply header into the `in_out` slot and
     /// the reply body into the payload buffer, so nothing is copied
-    /// afterwards. Returns `None` if the entry already holds the reply.
-    fn request(&mut self) -> Result<Option<Request<'_>>> {
+    /// afterwards. `setxattr_ext` tells whether the connection negotiated
+    /// `FsOptions::SETXATTR_EXT`. Returns `None` if the entry already holds
+    /// the reply.
+    fn request(&mut self, setxattr_ext: bool) -> Result<Option<Request<'_>>> {
         let in_header = self.in_header();
         // Answer an opcode the table doesn't know with ENOSYS here, rather
         // than dispatch it without its arguments. The kernel then stops
         // sending it, as it does with FUSE_COPY_FILE_RANGE_64.
-        let Some((args_len, has_out_args)) = op_args(in_header.opcode) else {
+        let Some((args_len, has_out_args)) = op_args(in_header.opcode, setxattr_ext) else {
             self.stage_error_reply(libc::ENOSYS);
             return Ok(None);
         };
@@ -2299,7 +2305,8 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
     /// them and the file.
     fn process(&self, entry: &mut UringEntry, idx: usize, state: &Mutex<RingState>) -> Result<()> {
         let slot = entry.zero_copy_slot;
-        let Some(request) = entry.request()? else {
+        let setxattr_ext = self.server.init_state().1.contains(FsOptions::SETXATTR_EXT);
+        let Some(request) = entry.request(setxattr_ext)? else {
             return Ok(());
         };
         let zc_io = request
@@ -2565,7 +2572,8 @@ impl<F: AsyncFileSystem + Send + Sync + 'static> UringWorker<F> {
         state: &Mutex<RingState>,
     ) -> Result<()> {
         let slot = entry.zero_copy_slot;
-        let Some(request) = entry.request()? else {
+        let setxattr_ext = self.server.init_state().1.contains(FsOptions::SETXATTR_EXT);
+        let Some(request) = entry.request(setxattr_ext)? else {
             return Ok(());
         };
         let zc_io = request
@@ -3110,7 +3118,7 @@ mod tests {
         AccessIn, AttrOut, BatchForgetIn, BmapIn, CopyFileRangeIn, CreateIn, EntryOut, FallocateIn,
         FlushIn, ForgetIn, FsyncIn, GetattrIn, GetxattrIn, InHeader, InitIn, InterruptIn, IoctlIn,
         LinkIn, LkIn, LseekIn, MkdirIn, MknodIn, Opcode, OpenIn, OutHeader, PollIn, ReadIn,
-        ReleaseIn, Rename2In, RenameIn, SetattrIn, SetxattrIn, StatxIn, WriteIn, ROOT_ID,
+        ReleaseIn, Rename2In, RenameIn, SetattrIn, SetxattrIn, SetxattrIn2, StatxIn, WriteIn, ROOT_ID,
     };
     use fuse_backend_core::api::filesystem::FsOptions;
     use fuse_backend_passthrough::{Config, PassthroughFs};
@@ -3311,16 +3319,26 @@ mod tests {
             (Opcode::Statx as u32, std::mem::size_of::<StatxIn>()),
         ];
         for &(op, len) in expected {
-            assert_eq!(op_args(op).map(|a| a.0), Some(len), "opcode {}", op);
+            assert_eq!(op_args(op, false).map(|a| a.0), Some(len), "opcode {}", op);
+        }
+        assert_eq!(
+            op_args(Opcode::Setxattr as u32, true),
+            Some((
+                std::mem::size_of::<SetxattrIn>() + std::mem::size_of::<SetxattrIn2>(),
+                false
+            ))
+        );
+        for op in (0..=64u32).filter(|&op| op != Opcode::Setxattr as u32) {
+            assert_eq!(op_args(op, true), op_args(op, false), "opcode {}", op);
         }
         // Everything else (holes, virtiofs-only and newer opcodes) isn't in
         // the table.
         for op in 0..=64u32 {
             if !expected.iter().any(|&(e, _)| e == op) {
-                assert_eq!(op_args(op), None, "opcode {}", op);
+                assert_eq!(op_args(op, false), None, "opcode {}", op);
             }
         }
-        assert_eq!(op_args(u32::MAX), None);
+        assert_eq!(op_args(u32::MAX, false), None);
         // The requests without out arguments, which take no reply body.
         let no_out_args = [
             Opcode::Forget,
@@ -3346,7 +3364,7 @@ mod tests {
         ];
         for &(op, _) in expected {
             let has_out_args = !no_out_args.iter().any(|&o| o as u32 == op);
-            assert_eq!(op_args(op).unwrap().1, has_out_args, "opcode {}", op);
+            assert_eq!(op_args(op, false).unwrap().1, has_out_args, "opcode {}", op);
         }
     }
 
