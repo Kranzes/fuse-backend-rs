@@ -323,6 +323,15 @@
   `mount(2)` or fusermount as before. With `set_target_mntns()`, a helper thread mounts and
   unmounts in that namespace, so root no longer needs nsenter and fusermount there.
   `auto_unmount` still takes fusermount.
+- [372](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/372): `UringConfig::defer_taskrun` makes the uring workers
+  create their rings with `IORING_SETUP_SINGLE_ISSUER` and `IORING_SETUP_DEFER_TASKRUN`, so the
+  kernel copies requests into their entries when they wait for the next one instead of
+  interrupting their handlers. On Linux 7.3, that made stats and 4 KiB reads that a client
+  sends one at a time faster. It is off by default, because Linux 7.2.0-7.2.13 and 7.3.0-7.3.1
+  can miss the wake-up of a worker waiting on such a ring. The workers of `new_async()` take
+  it only on kernels that wake epoll for deferred task work, 7.4, 7.3.2, 7.2.14, 6.18.60 and
+  later releases of those branches. With it, zero-copy IO from a thread other than the worker
+  fails with EEXIST. `UringConfig` has a new field.
 
 ### Changed
 - [326](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/326): `fuse-backend-core` uses tokio-uring 0.5 and io-uring 0.6 instead of 0.4 and 0.5.
