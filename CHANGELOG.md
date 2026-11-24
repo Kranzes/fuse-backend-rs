@@ -234,6 +234,11 @@
   and `AsyncFileReadWriteVolatile::raw_fd()` let `Reader::async_read_to_at()` move zero-copy
   data, and the fixed-buffer operations of a request run on the worker's ring while its other
   requests go on. Copies through memory, for files without a descriptor, still block the worker.
+- [319](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/319): A `StopSignal` sets the stop flag of `FuseDevTask`s and wakes the ones that wait for a request
+  on the tokio runtime. `FuseDevTask::new()` takes one in place of the `Arc<AtomicBool>`, which
+  still works and makes an idle task check the flag every 100ms. `AsyncFuseServing` and the
+  `/dev/fuse` thread of `UringFuseServing::new_async()` stop with a signal, so their idle tasks
+  no longer wake 10 times a second.
 
 ### Changed
 - [325](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/325): The `fuse-backend-fusedev` `uring` transport uses io-uring 0.6 instead of 0.5,
@@ -456,6 +461,11 @@
   them all back, and leaks them if that takes more than a second. A worker that stopped on an
   error while the connection was up freed entries the kernel could still copy requests into. A
   signal that interrupts the worker's `io_uring_enter()` calls no longer stops it.
+- [319](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/319): Dropping a `UringFuseServing` whose mount is busy no longer hangs until the files in the mount
+  close. The unmount leaves such a connection up, and the workers kept waiting for requests. Now
+  the stop signal wakes them through a poll on their rings. Once they have served the requests
+  they took, the last one ends the connection, as closing `/dev/fuse` ends a classic one. An
+  async worker whose entries all wait on handlers no longer checks its stop flag every 100ms.
 - `UringWriter::write_from_at()` fails when the data doesn't fit into the reply body. It counted
   free space in the header slot too, and could read file data past the end of the body.
 - [278](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/278): Treat `EOPNOTSUPP`/`ENOTSUP` and `ENOSYS` from `getxattr` as "not opaque"
