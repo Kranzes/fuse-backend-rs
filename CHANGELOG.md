@@ -348,6 +348,9 @@
 - [375](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/375): `UringFuseServing::new_async()` takes a `bufs_per_queue` smaller than
   `entries_per_queue` as it is, which caps the memory of its pools. Requests that need a buffer
   then wait while the handlers of others wait.
+- [383](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/383): With `passthrough::Config::uring_zero_copy`, read-only opens of files smaller
+  than the new `Config::uring_zero_copy_min_size`, 64 KiB by default, don't ask for zero-copy.
+  The kernel chooses zero-copy per open, and smaller READs copy faster.
 
 ### Changed
 - [326](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/326): `fuse-backend-core` uses tokio-uring 0.5 and io-uring 0.6 instead of 0.4 and 0.5.

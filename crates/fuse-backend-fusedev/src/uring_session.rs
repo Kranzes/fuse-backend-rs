@@ -123,7 +123,9 @@ pub struct UringConfig {
     /// `ZeroCopyReader::read_to()`, or their async versions, with a file
     /// that has a descriptor (`raw_fd()` of `FileReadWriteVolatile` or
     /// `AsyncFileReadWriteVolatile`). Other files take a slower copy through
-    /// memory.
+    /// memory. The kernel takes every READ and WRITE of such an open, and
+    /// small ones cost more than copying, see "Small reads" in
+    /// `docs/fuse-uring-performance.md`.
     pub zero_copy: bool,
     /// Create the worker rings with `IORING_SETUP_SINGLE_ISSUER` and
     /// `IORING_SETUP_DEFER_TASKRUN`, so the kernel copies a request into its
@@ -5421,6 +5423,8 @@ mod tests {
     /// Read a file through a zero-copy mount served with `start`. Its reads
     /// are zero-copy requests, and none copies the data through memory, also
     /// where `PassthroughFs` reads page-cache hits inline with `RWF_NOWAIT`.
+    /// A file smaller than `Config::uring_zero_copy_min_size` reads without
+    /// zero-copy.
     fn check_zero_copy_reads(start: StartFn<PassthroughFs<()>>) {
         if !real_root() {
             eprintln!("zero-copy needs root, skipping");
@@ -5429,6 +5433,9 @@ mod tests {
         let src = TempDir::new().unwrap();
         let data: Vec<u8> = (0..1 << 20).map(|n| (n % 251) as u8).collect();
         std::fs::write(src.as_path().join("file"), &data).unwrap();
+        let min = Config::default().uring_zero_copy_min_size as usize;
+        let small = &data[..min - 1];
+        std::fs::write(src.as_path().join("small"), small).unwrap();
         let mnt = TempDir::new().unwrap();
         // With `do_import`, init doesn't negotiate opens away as it does
         // behind a Vfs, so the kernel sends OPEN.
@@ -5453,6 +5460,8 @@ mod tests {
             return;
         }
         let counts = &serving.zero_copy_counts;
+        assert!(std::fs::read(mnt.as_path().join("small")).unwrap() == small);
+        assert_eq!(counts.requests.load(Ordering::Relaxed), 0);
         assert!(std::fs::read(mnt.as_path().join("file")).unwrap() == data);
         assert!(counts.requests.load(Ordering::Relaxed) > 0);
         assert_eq!(counts.bounces.load(Ordering::Relaxed), 0);
