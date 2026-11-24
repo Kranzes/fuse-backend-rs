@@ -278,9 +278,10 @@
 - [281](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/281): On Linux 7.3 and later, `UringFuseServing` gives each kernel queue a buffer pool of
   `UringConfig::bufs_per_queue` payload buffers. The kernel lends them to the queue's ring entries
   while they serve a request, so with fewer buffers than entries a mount needs less memory.
-  `bufs_per_queue` defaults to 4, the default number of entries, and counts as at most
-  `entries_per_queue`. 0 keeps a buffer per entry, as on older kernels. `UringConfig` has a new
-  field, so struct literals need `..Default::default()`.
+  `bufs_per_queue`, an `Option<usize>`, counts as at most `entries_per_queue`, and `Some(0)`
+  keeps a buffer per entry, as on older kernels. `None`, the default, gives
+  `UringFuseServing::new()` 4 buffers. `UringConfig` has a new field, so struct literals need
+  `..Default::default()`.
 - [281](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/281): `abi::fuse_uring` has the commands, INIT flag and fields of protocol 7.46 for buffer pools.
   `Server::uring_bufpool_supported()` tells whether the kernel offered them at INIT, and
   `Server::uring_payload_size()` returns the size of the kernel's payload buffers.
@@ -314,7 +315,7 @@
 - [317](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/317): `UringFuseServing::new_async()` serves FUSE-over-io_uring with the `AsyncFileSystem` handlers.
   Each worker runs an async runtime and keeps up to one request per ring entry in flight, so
   handlers that wait don't hold up the worker's other requests.
-  Its queues get `entries_per_queue` pool buffers, because a request keeps its buffer
+  By default its queues get a pool buffer per entry, because a request keeps its buffer
   while its handler waits. A worker lets its runtime park every 64 requests, so the timers and
   tokio-uring IO that handlers wait for still run while requests keep coming.
 - [318](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/318): `UringFuseServing::new_async()` serves zero-copy too. `ZeroCopySource::async_write_to_file()`
@@ -344,6 +345,9 @@
   it only on kernels that wake epoll for deferred task work, 7.4, 7.3.2, 7.2.14, 6.18.60 and
   later releases of those branches. With it, zero-copy IO from a thread other than the worker
   fails with EEXIST. `UringConfig` has a new field.
+- [375](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/375): `UringFuseServing::new_async()` takes a `bufs_per_queue` smaller than
+  `entries_per_queue` as it is, which caps the memory of its pools. Requests that need a buffer
+  then wait while the handlers of others wait.
 
 ### Changed
 - [326](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/326): `fuse-backend-core` uses tokio-uring 0.5 and io-uring 0.6 instead of 0.4 and 0.5.
