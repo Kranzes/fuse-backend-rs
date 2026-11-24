@@ -85,6 +85,10 @@
   `system.posix_acl_access` when the kernel sends `SETXATTR_ACL_KILL_SGID`.
   `Vfs` passes the flags to its backends but leaves the option out of its
   default `out_opts`.
+- [343](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/343): `Server::set_request_timeout()` asks Linux 6.14 and later to
+  abort the connection when a request stays unanswered for longer than the
+  given number of seconds, through `FsOptions::REQUEST_TIMEOUT` and the new
+  `InitOut::request_timeout`.
 - [304](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/304): Give FreeBSD a verification path. The Linux wire-format ABI
   body moves out of `fuse_abi_linux.rs` into a shared `fuse_abi_wire.rs`
   (each per-OS prelude re-exports the libc names the body uses), and a new
@@ -292,6 +296,8 @@
   kernel.
 - [339](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/339): `fuse-backend-core` no longer enables vm-memory's unused `backend-mmap` feature,
   which doesn't build on FreeBSD. A crate that uses vm-memory's mmap types has to enable it itself.
+- [343](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/343): `InitOut::unused` is now `[u16; 11]`, because the new
+  `request_timeout` takes its first two bytes.
 - [325](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/325): The `fuse-backend-fusedev` `uring` transport uses io-uring 0.6 instead of 0.5,
   and depends on it only on Linux.
 - [324](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/324): `fuse-backend-core` uses bitflags 2 instead of 1. The flag types (`FsOptions`,
