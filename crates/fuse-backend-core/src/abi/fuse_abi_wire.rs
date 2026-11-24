@@ -14,7 +14,6 @@ use std::mem;
 use bitflags::bitflags;
 use vm_memory::ByteValued;
 
-
 pub const KERNEL_VERSION: u32 = 7;
 
 /// Minor version number of this interface.
@@ -907,6 +906,7 @@ pub enum Opcode {
     CopyFileRange = 47,
     SetupMapping = 48,
     RemoveMapping = 49,
+    Tmpfile = 51,
     Statx = 52,
     MaxOpcode = 53,
 
@@ -969,6 +969,7 @@ impl From<u32> for Opcode {
             47 => Opcode::CopyFileRange,
             48 => Opcode::SetupMapping,
             49 => Opcode::RemoveMapping,
+            51 => Opcode::Tmpfile,
             52 => Opcode::Statx,
             _ => Opcode::MaxOpcode,
         }
@@ -1766,6 +1767,7 @@ mod tests {
             Opcode::CopyFileRange,
             Opcode::SetupMapping,
             Opcode::RemoveMapping,
+            Opcode::Tmpfile,
             Opcode::Statx,
         ];
         for op in valid {
@@ -1780,6 +1782,7 @@ mod tests {
         assert_eq!(Opcode::from(0) as u32, Opcode::MaxOpcode as u32);
         assert_eq!(Opcode::from(7) as u32, Opcode::MaxOpcode as u32);
         assert_eq!(Opcode::from(19) as u32, Opcode::MaxOpcode as u32);
+        assert_eq!(Opcode::from(50) as u32, Opcode::MaxOpcode as u32);
         assert_eq!(
             Opcode::from(Opcode::MaxOpcode as u32) as u32,
             Opcode::MaxOpcode as u32

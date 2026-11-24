@@ -67,6 +67,10 @@
   Both default to `ENOSYS`, after which the kernel uses `GETATTR` for the rest of the connection.
   `Vfs` passes them on, and answers with `getattr()` for the pseudo file system and for backends
   without `statx()`. `PassthroughFs` serves them with the host `statx()` on Linux.
+- [335](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/335): `FileSystem::tmpfile()` serves `FUSE_TMPFILE` (protocol 7.37, Linux 6.1), which
+  the kernel sends for an `open(2)` with `O_TMPFILE`. It defaults to `ENOSYS`. The async server
+  calls `AsyncFileSystem::async_tmpfile()`, which defaults to `tmpfile()`. `Vfs` passes both on,
+  and `PassthroughFs` serves them with `openat(O_TMPFILE)` on Linux.
 - [304](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/304): Give FreeBSD a verification path. The Linux wire-format ABI
   body moves out of `fuse_abi_linux.rs` into a shared `fuse_abi_wire.rs`
   (each per-OS prelude re-exports the libc names the body uses), and a new

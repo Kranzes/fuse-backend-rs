@@ -231,6 +231,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
             x if x == Opcode::Lseek as u32 => self.async_lseek(ctx).await,
             x if x == Opcode::CopyFileRange as u32 => self.async_copy_file_range(ctx).await,
             x if x == Opcode::Statx as u32 => self.async_statx(ctx).await,
+            x if x == Opcode::Tmpfile as u32 => self.async_create(ctx).await,
             #[cfg(feature = "virtiofs")]
             x if x == Opcode::SetupMapping as u32 => self.setupmapping(ctx, vu_req),
             #[cfg(feature = "virtiofs")]
@@ -1021,6 +1022,7 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
         }
     }
 
+    /// Serves CREATE and TMPFILE, like the sync `create()`.
     async fn async_create<S: BitmapSlice, W: Writer>(
         &self,
         ctx: &mut SrvContext<'_, F, S, W>,
@@ -1030,10 +1032,15 @@ impl<F: AsyncFileSystem + Sync> Server<F> {
         let name = Self::parse_name(&buf)?;
         self.set_create_extensions(ctx, &buf[name.to_bytes_with_nul().len()..])?;
 
-        let result = self
-            .fs
-            .async_create(ctx.context(), ctx.nodeid(), name, args)
-            .await;
+        let result = if ctx.in_header.opcode == Opcode::Tmpfile as u32 {
+            self.fs
+                .async_tmpfile(ctx.context(), ctx.nodeid(), args)
+                .await
+        } else {
+            self.fs
+                .async_create(ctx.context(), ctx.nodeid(), name, args)
+                .await
+        };
 
         match result {
             Ok((entry, handle, opts, passthrough)) => {
@@ -2140,6 +2147,74 @@ mod tests {
         // DirFs keeps the default, which answers ENOSYS.
         let server = Server::new(DirFs::default());
         let reply = serve(&server, Opcode::Statx, 5, statx_in(0)).await;
+        assert_eq!(reply_error(&reply), -libc::ENOSYS);
+    }
+
+    /// Answers TMPFILE with the mode of the request as the new inode. Counts the async calls.
+    #[derive(Default)]
+    struct TmpfileFs {
+        async_calls: AtomicUsize,
+    }
+
+    impl FileSystem for TmpfileFs {
+        type Inode = u64;
+        type Handle = u64;
+
+        fn tmpfile(
+            &self,
+            _ctx: &Context,
+            parent: u64,
+            args: CreateIn,
+        ) -> io::Result<(Entry, Option<u64>, OpenOptions, Option<u32>)> {
+            assert_eq!(parent, 1);
+            let entry = Entry {
+                inode: args.mode.into(),
+                ..Default::default()
+            };
+            Ok((entry, Some(9), OpenOptions::KEEP_CACHE, None))
+        }
+    }
+
+    #[async_trait]
+    impl AsyncFileSystem for TmpfileFs {
+        async fn async_tmpfile(
+            &self,
+            ctx: &Context,
+            parent: u64,
+            args: CreateIn,
+        ) -> io::Result<(Entry, Option<u64>, OpenOptions, Option<u32>)> {
+            self.async_calls.fetch_add(1, Ordering::Relaxed);
+            tokio::task::yield_now().await;
+            self.tmpfile(ctx, parent, args)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tmpfile() {
+        // The kernel names the file "/".
+        let mut body = [0u8; size_of::<CreateIn>() + 2];
+        let args = CreateIn {
+            flags: libc::O_RDWR as u32,
+            mode: 0o100600,
+            ..Default::default()
+        };
+        body[..size_of::<CreateIn>()].copy_from_slice(args.as_slice());
+        body[size_of::<CreateIn>()] = b'/';
+
+        let server = Server::new(TmpfileFs::default());
+        let reply = serve(&server, Opcode::Tmpfile, 1, body).await;
+        assert_eq!(server.fs.async_calls.load(Ordering::Relaxed), 1);
+        let (entry, open) = reply[size_of::<OutHeader>()..].split_at(size_of::<EntryOut>());
+        let entry_out = EntryOut::from_slice(entry).unwrap();
+        let open_out = OpenOut::from_slice(open).unwrap();
+        assert_eq!(entry_out.nodeid, 0o100600);
+        assert_eq!(
+            (open_out.fh, open_out.open_flags),
+            (9, OpenOptions::KEEP_CACHE.bits())
+        );
+
+        // DirFs keeps the default, which answers ENOSYS.
+        let reply = serve(&Server::new(DirFs::default()), Opcode::Tmpfile, 1, body).await;
         assert_eq!(reply_error(&reply), -libc::ENOSYS);
     }
 

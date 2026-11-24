@@ -318,6 +318,7 @@ fn op_args(opcode: u32) -> Option<(usize, bool)> {
         Opcode::Rename2 => (16, false),                      // Rename2In
         Opcode::Lseek => (24, true),                         // LseekIn
         Opcode::CopyFileRange => (56, true),                 // CopyFileRangeIn
+        Opcode::Tmpfile => (16, true),                       // CreateIn
         Opcode::Statx => (24, true),                         // StatxIn
         // SETUPMAPPING/REMOVEMAPPING only exist on the virtiofs DAX window
         // path, never on /dev/fuse. Opcode::from() maps the numbers without
@@ -3331,6 +3332,7 @@ mod tests {
                 Opcode::CopyFileRange as u32,
                 std::mem::size_of::<CopyFileRangeIn>(),
             ),
+            (Opcode::Tmpfile as u32, std::mem::size_of::<CreateIn>()),
             (Opcode::Statx as u32, std::mem::size_of::<StatxIn>()),
         ];
         for &(op, len) in expected {

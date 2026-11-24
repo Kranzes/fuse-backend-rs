@@ -1461,6 +1461,18 @@ mod tests {
             };
             Ok((sx, Duration::from_secs(1)))
         }
+        fn tmpfile(
+            &self,
+            _: &Context,
+            _: Self::Inode,
+            _: CreateIn,
+        ) -> Result<(Entry, Option<u64>, OpenOptions, Option<u32>)> {
+            let entry = Entry {
+                inode: 5,
+                ..Default::default()
+            };
+            Ok((entry, Some(9), OpenOptions::empty(), None))
+        }
     }
 
     #[cfg(feature = "async-io")]
@@ -1924,6 +1936,27 @@ mod tests {
         // The mounted file system gets its own inode number and the kernel's handle.
         let polled = vfs.poll(&ctx, VfsInode(0x100_0000_0000_0001), 0, 7, 0, 0);
         assert_eq!(polled.unwrap(), 1 << 16 | 7);
+    }
+
+    #[test]
+    fn test_vfs_tmpfile() {
+        let vfs = Vfs::new(VfsOptions::default());
+        let ctx = Context::new();
+        let one = vfs.mount(Box::new(FakeFileSystemOne {}), "/x/y").unwrap();
+        let two = vfs.mount(Box::new(FakeFileSystemTwo {}), "/z").unwrap();
+
+        // The pseudo file system and a backend without tmpfile() answer EOPNOTSUPP, which
+        // doesn't turn O_TMPFILE off for the other mounts like ENOSYS would.
+        for parent in [ROOT_ID.into(), VfsInode::new(one, 1)] {
+            let err = vfs.tmpfile(&ctx, parent, CreateIn::default()).unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(libc::EOPNOTSUPP));
+        }
+
+        let (entry, handle, _, _) = vfs
+            .tmpfile(&ctx, VfsInode::new(two, 1), CreateIn::default())
+            .unwrap();
+        assert_eq!(entry.inode, u64::from(VfsInode::new(two, 5)));
+        assert_eq!(handle, Some(9));
     }
 
     #[test]
