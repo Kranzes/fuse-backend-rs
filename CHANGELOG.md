@@ -306,6 +306,11 @@
   tokio|uring`, `--no-writeback` and `--kernel-passthrough`. CI also runs xfstests with
   `SyncFuseServing`, with `AsyncFuseServing` on tokio and on tokio-uring, with
   `UringFuseServing`, without the writeback cache and with kernel passthrough.
+- [365](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/365): On Linux 5.2 and later, `FuseSession::mount()` mounts through `fsopen()`,
+  `fsmount()` and `move_mount()`, with the options `mount(2)` gets. If that fails, it mounts with
+  `mount(2)` or fusermount as before. With `set_target_mntns()`, a helper thread mounts and
+  unmounts in that namespace, so root no longer needs nsenter and fusermount there.
+  `auto_unmount` still takes fusermount.
 
 ### Changed
 - [326](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/326): `fuse-backend-core` uses tokio-uring 0.5 and io-uring 0.6 instead of 0.4 and 0.5.
