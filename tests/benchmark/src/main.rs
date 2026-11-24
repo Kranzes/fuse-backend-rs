@@ -7,7 +7,7 @@
 //! and asynchronous IO paths with external tools such as fio.
 //!
 //! Usage: `fuse-backend-rs-benchmark <src> <mountpoint> [--async] [--uring] [--threads N]
-//! [--sync-blocking] [--thread-pool] [--uring-entries N] [--uring-bufs N]
+//! [--async-block-idle] [--sync-blocking] [--thread-pool] [--uring-entries N] [--uring-bufs N]
 //! [--uring-zero-copy] [--uring-zero-copy-min-size N] [--uring-defer-taskrun]
 //! [--no-backing-direct-io] [--kernel-passthrough] [--no-writeback] [--delay-us N]
 //! [--delay-prefix P] [--splice]`
@@ -100,6 +100,7 @@ mod daemon {
         src: String,
         dest: String,
         as_async: bool,
+        async_block_idle: bool,
         as_uring: bool,
         sync_blocking: bool,
         thread_pool: bool,
@@ -149,7 +150,7 @@ mod daemon {
 
     fn help() {
         println!(
-            "Usage:\n   fuse-backend-rs-benchmark <src> <mountpoint> [--async] [--uring] [--threads N] [--sync-blocking] [--thread-pool] [--uring-entries N] [--uring-bufs N] [--uring-zero-copy] [--uring-zero-copy-min-size N] [--uring-defer-taskrun] [--no-backing-direct-io] [--kernel-passthrough] [--no-writeback] [--delay-us N] [--delay-prefix P] [--splice]\n"
+            "Usage:\n   fuse-backend-rs-benchmark <src> <mountpoint> [--async] [--uring] [--threads N] [--async-block-idle] [--sync-blocking] [--thread-pool] [--uring-entries N] [--uring-bufs N] [--uring-zero-copy] [--uring-zero-copy-min-size N] [--uring-defer-taskrun] [--no-backing-direct-io] [--kernel-passthrough] [--no-writeback] [--delay-us N] [--delay-prefix P] [--splice]\n"
         );
     }
 
@@ -171,6 +172,7 @@ mod daemon {
             src: args[1].clone(),
             dest: args[2].clone(),
             as_async: false,
+            async_block_idle: false,
             as_uring: false,
             sync_blocking: false,
             thread_pool: false,
@@ -191,6 +193,7 @@ mod daemon {
         while idx < args.len() {
             match args[idx].as_str() {
                 "--async" => res.as_async = true,
+                "--async-block-idle" => res.async_block_idle = true,
                 "--uring" => res.as_uring = true,
                 "--sync-blocking" => res.sync_blocking = true,
                 "--thread-pool" => res.thread_pool = true,
@@ -249,8 +252,11 @@ mod daemon {
             help();
             return Err(Error::from_raw_os_error(libc::EINVAL));
         }
-        // The blocking thread pool belongs to the async runtime.
-        if res.thread_pool && !res.as_async {
+        // The blocking thread pool belongs to the async workers, and the exclusive idle wait to
+        // those of the async serving layer.
+        if (res.thread_pool && !res.as_async)
+            || (res.async_block_idle && (!res.as_async || res.as_uring))
+        {
             help();
             return Err(Error::from_raw_os_error(libc::EINVAL));
         }
@@ -352,6 +358,7 @@ mod daemon {
         } else if args.as_async {
             let cfg = AsyncServingConfig {
                 workers,
+                block_while_idle: args.async_block_idle,
                 ..Default::default()
             };
             run_until_signal(
