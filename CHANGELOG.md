@@ -580,6 +580,10 @@
   directory. With `FsOptions::ALLOW_IDMAP` those ids are `FUSE_INVALID_UIDGID`,
   and the new `Config::allow_idmap` now lets `OverlayFs` offer the flag.
   `OverlayFs` creates whiteouts as the daemon too.
+- [379](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/379): The servers check that a reply fits in the reply buffer before they write it. A
+  reply that doesn't fit gets ERANGE if it is a GETXATTR or LISTXATTR value, and EIO otherwise.
+  The write used to fail and leave the request without a reply. A READ gets EIO instead of the
+  data when the file system returns more bytes than the request asks for.
 - [303](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/303): The sync server answers a SETXATTR request it received in full
   but cannot decode — no NUL separator in the attribute name, or a value size
   that disagrees with the body — with `EINVAL` instead of dropping it. FUSE
