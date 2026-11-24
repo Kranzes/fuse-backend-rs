@@ -326,6 +326,8 @@
   By default its queues get a pool buffer per entry, because a request keeps its buffer
   while its handler waits. A worker lets its runtime park every 64 requests, so the timers and
   tokio-uring IO that handlers wait for still run while requests keep coming.
+  Its queues get `entries_per_queue` pool buffers, because a request keeps its buffer
+  while its handler waits.
 - [318](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/318): `UringFuseServing::new_async()` serves zero-copy too. `ZeroCopySource::async_write_to_file()`
   and `AsyncFileReadWriteVolatile::raw_fd()` let `Reader::async_read_to_at()` move zero-copy
   data, and the fixed-buffer operations of a request run on the worker's ring while its other
@@ -359,6 +361,11 @@
 - [383](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/383): With `passthrough::Config::uring_zero_copy`, read-only opens of files smaller
   than the new `Config::uring_zero_copy_min_size`, 64 KiB by default, don't ask for zero-copy.
   The kernel chooses zero-copy per open, and smaller READs copy faster.
+- [NNN](link): `UringConfig::pin_workers` runs each worker of `UringFuseServing` only on the CPUs
+  of the queues whose last ring entry it registers, so that a client that waits for each reply
+  and its worker share a CPU. It is off by default, because the link holds only until a queue
+  has several requests at once, and threads that a worker starts inherit its CPUs. `UringConfig`
+  has a new field.
 
 ### Changed
 - [326](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/326): `fuse-backend-core` uses tokio-uring 0.5 and io-uring 0.6 instead of 0.4 and 0.5.
@@ -397,6 +404,14 @@
   the ring refuses that thread's wait for it. `ZeroCopySource` uses `#[async_trait]` instead of
   `#[async_trait(?Send)]`, so its `async_write_to_file()` future is `Send`, and transports can
   implement the new `Writer::async_write_from_fd()`.
+- [NNN](link): While none of their requests waits for anything but its zero-copy operation on
+  the ring, the async workers of `UringFuseServing::new_async()` wait for the next request in
+  `io_uring_enter()` instead of epoll, which saves a trip through the runtime per request. They
+  let their runtime park at least every millisecond, so tasks, timers and tokio-uring IO on a
+  worker's runtime run up to about 1 ms late.
+- [NNN](link): The async workers of `UringFuseServing::new_async()` poll each new request once
+  before they hand it to their `FuturesUnordered`, so a request that its handler finishes at
+  once, such as a cache hit, costs no task of its own.
 - [325](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/325): The `fuse-backend-fusedev` `uring` transport uses io-uring 0.6 instead of 0.5,
   and depends on it only on Linux.
 - [324](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/324): `fuse-backend-core` uses bitflags 2 instead of 1. The flag types (`FsOptions`,

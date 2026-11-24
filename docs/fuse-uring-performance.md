@@ -741,6 +741,211 @@ deferred task work, 4 KiB reads at depth 16 gained 3%, 7% in the earlier
 run, with 40% of the `io_uring_enter()` calls, and the other rows
 stayed within the spread of the runs.
 
+The loop also polls each new request once itself, before it hands the
+request to its `FuturesUnordered`, and stages the commit right away when
+the request is done. Cache hits, LOOKUP and GETATTR are done then, and
+skip the task, waker and ready queue of `FuturesUnordered`. The request
+futures live in boxes that the loop reuses. On the 96-core machine of
+the table above, no row moved beyond the spread of the runs. With the
+wait in the ring of "Latency of the async workers" below, in the 4-vCPU
+guest and setup of that section, before and after, also with
+`UringConfig::pin_workers`, medians of 3 passes in one boot:
+
+| Workload | Before | After | Pinned, before | After |
+|----------|------|-----|--------------|-----|
+| Walk with opens | 45.0k/s | 45.3k/s | 50.8k/s | 51.8k/s |
+| 2 KiB files, 1 thread | 28.4k/s | 29.0k/s | 32.2k/s | 32.9k/s |
+| 2 KiB files, 4 threads | 75.9k/s | 76.7k/s | 90.4k/s | 86.7k/s |
+| 4 KiB, 1 job, depth 1 | 122k IOPS | 124k IOPS | 161k IOPS | 170k IOPS |
+| 4 KiB, 4 jobs, depth 1 | 603k IOPS | 613k IOPS | 608k IOPS | 613k IOPS |
+| 4 KiB, 4 jobs, depth 16 | 707k IOPS | 750k IOPS | 708k IOPS | 750k IOPS |
+
+Small files got 1% to 2% faster and 4 KiB reads at depth 16 6%,
+beyond the spread of the passes. The pinned rows spread by up to 35%.
+In another boot, pinned 4 KiB reads at depth 1 went from 161k-165k to
+170k-177k IOPS. No buffered read goes through `FuturesUnordered`
+anymore. A zero-copy request still waits for its operation, so it still
+goes there.
+
+## Latency of the async workers
+
+A client that waits for each reply, such as a walk of a directory tree
+or a program that stats, opens and reads small files one after the
+other, waits for every request from end to end. With few CPUs, and in a
+virtual machine, much of that time went to waking threads.
+
+The benchmark daemon served a tmpfs with `--uring --async`, 4 workers
+and 16 entries per queue, in a KVM guest with 4 vCPUs and Linux 7.3.4,
+whose vCPUs ran on 8 host CPUs of their own. perf stat, `strace -c` and
+the IPI tracepoints, while one fio job read 4 KiB at depth 1 or one
+thread opened and read 2 KiB files with kernel passthrough, showed
+three costs.
+
+On a ring without deferred task work, the kernel hands a request to the
+worker as task work that it signals with TWA_SIGNAL. A worker asleep in
+`epoll_wait()` gets EINTR before the work posts the completion, goes
+through its runtime and sleeps again, and gets the readiness in a
+second `epoll_wait()`. tokio-uring also makes an `io_uring_enter()` on
+its own ring each time the runtime parks. The daemon made 7.3 syscalls
+per 4 KiB read and 33 per 2 KiB file. `AsyncFuseServing` made 16 per
+read with `--splice` and 59 per file with kernel passthrough, because
+the epoll of every worker wakes for each request.
+
+The worker that holds the entry ran on another CPU than the client, so
+the request woke the worker with an IPI and the reply woke the client
+with another, 2.5 per read. In a guest, an IPI makes the vCPU that
+sends it exit to the host.
+
+On tmpfs, every zero-copy `READ_FIXED` went to an io-wq thread, because
+tmpfs doesn't read without blocking (`preadv2()` with `RWF_NOWAIT` fails
+with EOPNOTSUPP there), and io_uring hands such a read to a thread. A
+zero-copy read took 3.4 context switches in the daemon, a copy 1.2.
+XFS and ext4 read cached data without blocking, so a `READ_FIXED` there
+completes in the `io_uring_enter()` that submits it. The zero-copy rows
+on tmpfs below pay for the threads.
+
+### Waiting in the ring
+
+While no request in flight waits for anything but its zero-copy
+operation, an async worker submits what is queued and waits for the
+next completion in `io_uring_enter()`, which runs the task work and
+returns with the request. It waits at most 1 ms at a time, and lets its
+runtime park at least every millisecond, also when busy, so tasks and
+timers on the worker's runtime, its IO, and tokio-uring's submissions
+are at most about 1 ms late. That took a 4 KiB read to 2.4
+syscalls, a zero-copy one to 2.3 and a 2 KiB file to 13.
+
+The table shows the daemon in that guest serving the tmpfs as root
+against `AsyncFuseServing` (`--async`), also with `--splice` and with
+`--kernel-passthrough`, all with 4 workers, and with
+`--no-backing-direct-io` except the passthrough ones. Each mode got a
+mount of its own per pass, which ran, in order: a walk with readdir and
+fstatat of 8 trees of 2,021 entries (43 directories of 46 files of 2
+KiB) in the fresh mount; the same walk of other trees that also opens
+and closes every file; 2,000 files of 2 KiB that one thread, or 4
+threads 500 each, stat, open, read and close in a loop; direct random
+4 KiB reads of 1 GiB files with fio, 1 or 4 jobs with psync or 4 jobs
+with libaio at depth 16; a direct sequential read of a 64 MiB file in
+1 MiB blocks; and 4 jobs reading 32 MiB files that way. The clients ran
+on the guest's 4 vCPUs too, fio for 3 seconds after 1 second of ramp.
+Medians of 3 passes, in alternating order:
+
+| Workload | /dev/fuse | Splice | Passthrough | Copy, before | After | Zero-copy, before | After | Passthrough, before | After |
+|----------|---------|------|-----------|------------|-----|-----------------|-----|-------------------|-----|
+| Walk | 148k/s | 148k/s | 159k/s | 164k/s | 156k/s | 156k/s | 165k/s | 162k/s | 167k/s |
+| Walk with opens | 32.8k/s | 34.1k/s | 31.5k/s | 42.9k/s | 44.2k/s | 42.6k/s | 44.8k/s | 40.3k/s | 42.5k/s |
+| 2 KiB files, 1 thread | 20.2k/s | 20.7k/s | 26.2k/s | 27.4k/s | 28.4k/s | 24.0k/s | 24.8k/s | 34.7k/s | 36.9k/s |
+| 2 KiB files, 4 threads | 82.5k/s | 84.1k/s | 108k/s | 70.6k/s | 75.1k/s | 62.9k/s | 64.0k/s | 91.3k/s | 97.8k/s |
+| 4 KiB, 1 job, depth 1 | 86.0k IOPS | 86.4k IOPS | 1.07M IOPS | 116k IOPS | 122k IOPS | 70.0k IOPS | 72.2k IOPS | 1.08M IOPS | 1.02M IOPS |
+| 4 KiB, 4 jobs, depth 1 | 422k IOPS | 421k IOPS | 3.82M IOPS | 472k IOPS | 598k IOPS | 219k IOPS | 200k IOPS | 3.82M IOPS | 3.73M IOPS |
+| 4 KiB, 4 jobs, depth 16 | 564k IOPS | 566k IOPS | 2.58M IOPS | 696k IOPS | 705k IOPS | 771k IOPS | 790k IOPS | 2.58M IOPS | 2.52M IOPS |
+| 64 MiB sequential | 10011 MiB/s | 10100 MiB/s | 31478 MiB/s | 11400 MiB/s | 11351 MiB/s | 15540 MiB/s | 15973 MiB/s | 30740 MiB/s | 31253 MiB/s |
+| 4 x 32 MiB | 34386 MiB/s | 32642 MiB/s | 44656 MiB/s | 13672 MiB/s | 16065 MiB/s | 26725 MiB/s | 26365 MiB/s | 44719 MiB/s | 44674 MiB/s |
+
+Small files got 3% to 7% faster, single 4 KiB reads 5% and 4 KiB reads
+from 4 jobs at depth 1 27%, with 9% to 14% less CPU time per request.
+The walks vary by 10% between passes in every mode, more than they
+changed, and the 4 x 32 MiB row by up to 50%. With kernel passthrough,
+`new_async()` beats `AsyncFuseServing` on the walks and on small files
+from one thread, and loses on small files from 4 threads, 98k against
+108k per second. Passthrough reads reach neither daemon. The copied
+reads beat splice everywhere but in the 4 x 32 MiB row, and zero-copy
+reads of 4 KiB lose to it on tmpfs because of the io-wq threads above.
+
+On the 96-core machine with 8 workers, fio and the other clients on 4
+CPUs of their own (CPU 8 for one, 8 to 11 for 4, 8 to 15 for 8), and 1
+MiB random reads from 8 jobs at depth 16 added. Medians of 4 passes for
+`new_async()`, 2 for `AsyncFuseServing`:
+
+| Workload | /dev/fuse | Splice | Passthrough | Copy, before | After | Zero-copy, before | After | Passthrough, before | After |
+|----------|---------|------|-----------|------------|-----|-----------------|-----|-------------------|-----|
+| Walk | 112k/s | 127k/s | 125k/s | 130k/s | 130k/s | 135k/s | 136k/s | 130k/s | 140k/s |
+| Walk with opens | 23.1k/s | 22.1k/s | 29.9k/s | 33.4k/s | 37.1k/s | 34.8k/s | 36.7k/s | 32.1k/s | 32.2k/s |
+| 2 KiB files, 1 thread | 12.8k/s | 12.9k/s | 17.9k/s | 21.9k/s | 23.9k/s | 19.2k/s | 20.8k/s | 27.8k/s | 29.5k/s |
+| 2 KiB files, 4 threads | 50.6k/s | 52.3k/s | 66.4k/s | 76.8k/s | 84.5k/s | 70.5k/s | 75.5k/s | 100k/s | 104k/s |
+| 4 KiB, 1 job, depth 1 | 54.6k IOPS | 51.4k IOPS | 1.30M IOPS | 91.6k IOPS | 104k IOPS | 74.2k IOPS | 77.9k IOPS | 1.29M IOPS | 1.29M IOPS |
+| 4 KiB, 4 jobs, depth 1 | 175k IOPS | 173k IOPS | 4.64M IOPS | 352k IOPS | 377k IOPS | 279k IOPS | 311k IOPS | 4.60M IOPS | 4.60M IOPS |
+| 4 KiB, 4 jobs, depth 16 | 263k IOPS | 266k IOPS | 2.95M IOPS | 692k IOPS | 730k IOPS | 793k IOPS | 746k IOPS | 2.94M IOPS | 2.92M IOPS |
+| 64 MiB sequential | 7077 MiB/s | 7947 MiB/s | 29274 MiB/s | 7392 MiB/s | 7426 MiB/s | 11297 MiB/s | 11256 MiB/s | 27665 MiB/s | 27409 MiB/s |
+| 4 x 32 MiB | 20896 MiB/s | 21414 MiB/s | 47847 MiB/s | 21891 MiB/s | 17998 MiB/s | 34109 MiB/s | 33754 MiB/s | 40754 MiB/s | 43567 MiB/s |
+| 1 MiB, 8 jobs, depth 16 | 36210 MiB/s | 35260 MiB/s | 26706 MiB/s | 36069 MiB/s | 35853 MiB/s | 89759 MiB/s | 88404 MiB/s | 26636 MiB/s | 26635 MiB/s |
+
+Small files got 4% to 10% faster and single 4 KiB reads 14%, with a
+fifth less CPU time per request. Some passes of every `new_async()` mode, with
+or without the change, ran up to twice as fast as the others, which the
+medians hide. The rows at depth 16 and of 4 x 32 MiB spread by 25% to
+45% between passes, and the change stayed within that.
+
+### Pinning the workers
+
+`UringConfig::pin_workers` runs each worker only on the CPUs of the
+queues whose last entry it registers. While a queue has one request at
+a time, its requests go to the entry that registered last, so the
+client and its worker share the client's CPU and wake each other there.
+In the guest, with 4 workers, each worker gets one vCPU. The rows
+"after a burst" ran right after the 4 jobs at depth 16 on the same
+mount. Medians of 3 passes, all of this section's modes in one boot of
+the guest:
+
+| Workload | Copy | Pinned | Passthrough | Pinned |
+|----------|----|------|-----------|------|
+| Walk with opens | 45.3k/s | 51.8k/s | 43.1k/s | 48.2k/s |
+| 2 KiB files, 1 thread | 29.0k/s | 32.9k/s | 37.2k/s | 41.6k/s |
+| 2 KiB files, 4 threads | 76.7k/s | 86.7k/s | 101k/s | 117k/s |
+| 4 KiB, 1 job, depth 1 | 124k IOPS | 170k IOPS | 1.06M IOPS | 1.08M IOPS |
+| 4 KiB, 4 jobs, depth 1 | 613k IOPS | 613k IOPS | 3.80M IOPS | 3.79M IOPS |
+| 4 KiB, 1 job, after a burst | 122k IOPS | 122k IOPS | 1.05M IOPS | 1.05M IOPS |
+| 2 KiB files, 1 thread, after a burst | 29.0k/s | 29.0k/s | 36.8k/s | 41.3k/s |
+| 4 x 32 MiB | 12578 MiB/s | 20135 MiB/s | 44693 MiB/s | 44626 MiB/s |
+
+On a fresh mount, small files got 12% to 16% faster, and the copied
+4 KiB reads at depth 1 37%. In other boots of the guest those reads
+measured 119k to 124k IOPS pinned, so that row depends on where the
+host runs the vCPUs. After the burst, the copied small files and reads
+lost the gain. The entry that became free last can then belong to any
+of the queue's workers, and a pinned worker on another CPU can't move to
+the client. With kernel passthrough, the small files kept it. On the
+96-core machine with 8 workers, each worker gets every eighth CPU.
+Medians of 2 passes pinned, 4 not:
+
+| Workload | Copy | Pinned |
+|----------|----|------|
+| Walk with opens | 37.1k/s | 41.0k/s |
+| 2 KiB files, 1 thread | 23.9k/s | 26.0k/s |
+| 2 KiB files, 4 threads | 84.5k/s | 80.3k/s |
+| 4 KiB, 1 job, depth 1 | 104k IOPS | 140k IOPS |
+| 4 KiB, 4 jobs, depth 1 | 377k IOPS | 387k IOPS |
+| 4 KiB, 1 job, after a burst | 103k IOPS | 103k IOPS |
+| 4 x 32 MiB | 17998 MiB/s | 15712 MiB/s |
+| 1 MiB, 8 jobs, depth 16 | 35853 MiB/s | 29682 MiB/s |
+
+Reads that keep many requests in flight lost 13% to 17% there.
+Threads that a worker starts, such as the blocking pool of its async
+runtime, inherit its CPUs too, which with a worker per CPU is one CPU
+for all of them. So the option is off by default.
+
+### What didn't pay
+
+- Fewer workers. With 2 workers instead of 4 in the 4-vCPU guest, one
+  pass on an earlier base kept the rows of one client as they were, and
+  made small files from 4 threads 30% slower and 4 KiB reads from 4 jobs
+  62% slower. On the 96-core machine, 4 workers on 8 CPUs of their own
+  measured within 5% of 8, but 13% slower on 1 MiB reads from 8 jobs at
+  depth 16, and 48 workers against 96 made small files from 4 threads
+  15% slower and those 1 MiB reads 25% faster. So the default stays a
+  worker per CPU. The default already stays below the number of queues,
+  which is the number of possible CPUs.
+- Yielding to the runtime before every wait in the ring, instead of the
+  deadline. It cost a GETATTR loop about a fifth of its requests, and a
+  yield doesn't run tokio-uring's park hook, so other tasks' io_uring
+  submissions still waited while requests kept coming.
+- Waiting in the ring only while no request is in flight, so that
+  zero-copy requests keep going through epoll. 1 MiB zero-copy reads
+  from 8 jobs at depth 16 on the 96-core machine measured 79 GiB/s
+  that way, 88 GiB/s with the count of waiting requests and 90 GiB/s
+  before, all within the 79 to 106 GiB/s that the runs before the change
+  spread over.
+
 ## Splicing READ replies on /dev/fuse
 
 The classic `/dev/fuse` transport can send a READ reply with `splice(2)`
@@ -937,7 +1142,14 @@ and uses the buffer pools of protocol 7.46 (kernel 7.3) when the kernel has them
   queue it holds entries of, so the count no longer has to match the
   queues. It is capped at `entries_per_queue` times the number of queues.
   Each worker is a thread with its own ring, and with zero-copy also a
-  memory file of one payload buffer.
+  memory file of one payload buffer. Half as many workers measured no better,
+  see "What didn't pay" above.
+
+- `pin_workers`: Default is off. It runs each worker on the CPUs of the
+  queues whose last entry it registers, which makes requests that a
+  client sends one at a time faster, most in a virtual machine, until a
+  queue has several requests at once. "Pinning the workers" above has
+  the numbers.
 
 - `defer_taskrun`: Default is off, because some kernels lose wake-ups
   with it. It speeds up requests that a client sends one at a time with
