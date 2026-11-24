@@ -1698,6 +1698,17 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         fsops::setxattr(file.as_raw_fd(), name, value, flags)
     }
 
+    #[cfg(target_os = "linux")]
+    fn syncfs(&self, _ctx: &Context, inode: Inode) -> io::Result<()> {
+        // syncfs(2) rejects the O_PATH descriptor that the inode keeps.
+        let file = self.open_inode(inode, libc::O_RDONLY)?;
+        // SAFETY: syncfs() takes no pointers, and `file` is open for the call.
+        if unsafe { libc::syncfs(file.as_raw_fd()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     fn getxattr(
         &self,
         _ctx: &Context,
@@ -2426,6 +2437,18 @@ mod tests {
         fs.setxattr(&ctx, entry.inode, &name, &acl, 0).unwrap();
         let (st, _) = fs.getattr(&ctx, entry.inode, None).unwrap();
         assert_eq!(st.st_mode & 0o7777, 0o755);
+    }
+
+    #[test]
+    fn test_syncfs() {
+        let source = TempDir::new().unwrap();
+        let fs = PassthroughFs::<()>::new(Config {
+            root_dir: source.as_path().to_str().unwrap().to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        fs.import().unwrap();
+        fs.syncfs(&prepare_context(), ROOT_ID).unwrap();
     }
 
     #[test]

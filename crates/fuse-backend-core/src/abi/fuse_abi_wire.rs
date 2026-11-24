@@ -925,6 +925,7 @@ pub enum Opcode {
     CopyFileRange = 47,
     SetupMapping = 48,
     RemoveMapping = 49,
+    Syncfs = 50,
     Tmpfile = 51,
     Statx = 52,
     MaxOpcode = 53,
@@ -988,6 +989,7 @@ impl From<u32> for Opcode {
             47 => Opcode::CopyFileRange,
             48 => Opcode::SetupMapping,
             49 => Opcode::RemoveMapping,
+            50 => Opcode::Syncfs,
             51 => Opcode::Tmpfile,
             52 => Opcode::Statx,
             _ => Opcode::MaxOpcode,
@@ -1276,6 +1278,13 @@ pub struct FsyncIn {
     pub padding: u32,
 }
 unsafe impl ByteValued for FsyncIn {}
+
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct SyncfsIn {
+    pub padding: u64,
+}
+unsafe impl ByteValued for SyncfsIn {}
 
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
@@ -1800,6 +1809,7 @@ mod tests {
             Opcode::CopyFileRange,
             Opcode::SetupMapping,
             Opcode::RemoveMapping,
+            Opcode::Syncfs,
             Opcode::Tmpfile,
             Opcode::Statx,
         ];
