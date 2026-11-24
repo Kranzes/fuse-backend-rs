@@ -665,6 +665,11 @@
   `UringFuseServing` worker does, instead of leaving the dead mount behind. They check the
   unique mount ID, so they also leave alone a file system mounted at the mountpoint after the
   session's mount was unmounted from outside while in use.
+- [381](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/381): With `UringFuseServing::new_async()`, `PassthroughFs` no longer reads the
+  reply of a zero-copy READ inline with `RWF_NOWAIT`. That read has no file descriptor to give
+  the transport, so its data went through the worker's memory file and a fixed-buffer read
+  that blocked the worker. The new `ZeroCopyWriter::prefers_fd()` and `Writer::prefers_fd()`
+  tell a file system when a writer is faster with a file that has a descriptor.
 
 ### Removed
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): Drop the vestigial `vhost` and `virtio-bindings` dependencies that the
