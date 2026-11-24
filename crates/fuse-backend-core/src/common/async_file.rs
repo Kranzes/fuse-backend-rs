@@ -6,16 +6,32 @@
 
 use std::any::Any;
 use std::fmt::{Debug, Formatter};
+use std::future::Future;
 use std::io::{ErrorKind, IoSlice, IoSliceMut};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::Path;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
+
+use tokio::task::futures::TaskLocalFuture;
 
 use crate::async_runtime::{RuntimeType, RUNTIME_TYPE};
 use crate::file_buf::FileVolatileBuf;
 use crate::{off64_t, preadv64, pwritev64};
 
 /// An adapter enum to support both tokio and tokio-uring asynchronous `File`.
+///
+/// With io_uring, the kernel uses the buffers of an IO until the IO completes, even if its
+/// future is dropped first. A `FileVolatileBuf` points into memory that the caller frees or
+/// reuses once the future is gone, so dropping the future of an IO into or out of one while
+/// it's in flight aborts the process, also when a panic unwinds through it. A transport that
+/// runs each request in a [`TrackedRequest`], as `FuseDevTask` does, leaks a request dropped
+/// with such IO in flight instead, which leaves the abort for a copy that a handler gives up on
+/// while its request goes on. A forgotten future skips the abort, so its memory must stay valid
+/// until the IO completes. `async_read_owned_at()` reads into a buffer that the IO owns, so its
+/// future may be dropped.
 pub enum File {
     /// Tokio asynchronous `File`.
     Tokio(tokio::fs::File),
@@ -124,17 +140,45 @@ impl File {
                 (res, bufs[0])
             }
             #[cfg(target_os = "linux")]
-            File::Uring(f) => f.read_at(buf, offset).await,
+            File::Uring(f) => uring_io(f.read_at(buf, offset)).await,
             File::Borrowed { fd, _guard, .. } => {
                 #[cfg(target_os = "linux")]
                 if self.uses_io_uring() {
-                    return uring_borrowed::read_at(*fd, _guard, buf, offset).await;
+                    return uring_io(uring_borrowed::read_at(*fd, _guard, buf, offset)).await;
                 }
                 let mut bufs = [buf];
                 let res = preadv(*fd, &mut bufs, offset);
                 (res, bufs[0])
             }
         }
+    }
+
+    /// Asynchronously read data at `offset` into `buf`, which the IO owns until it completes.
+    ///
+    /// The data goes to the start of `buf`, up to its capacity, and the length of `buf` grows to
+    /// cover it. Unlike IO into a borrowed buffer, this IO may be dropped in flight, because
+    /// tokio-uring keeps `buf` until the kernel is done with it.
+    pub async fn async_read_owned_at(
+        &self,
+        mut buf: Vec<u8>,
+        offset: u64,
+    ) -> (std::io::Result<usize>, Vec<u8>) {
+        #[cfg(target_os = "linux")]
+        match self {
+            File::Uring(f) => return f.read_at(buf, offset).await,
+            File::Borrowed { fd, _guard, .. } if self.uses_io_uring() => {
+                return uring_borrowed::read_at(*fd, _guard, buf, offset).await;
+            }
+            _ => {}
+        }
+        // Safe because the buffer covers the capacity of `buf`, which outlives the read.
+        let vbuf = unsafe { FileVolatileBuf::from_raw_ptr(buf.as_mut_ptr(), 0, buf.capacity()) };
+        let (res, _) = self.async_read_at(vbuf, offset).await;
+        if let Ok(n) = res {
+            // Safe because the read initialized the first `n` bytes.
+            unsafe { buf.set_len(buf.len().max(n)) };
+        }
+        (res, buf)
     }
 
     /// Asynchronously read data at `offset` into buffers.
@@ -151,11 +195,11 @@ impl File {
                 (res, bufs)
             }
             #[cfg(target_os = "linux")]
-            File::Uring(f) => f.readv_at(bufs, offset).await,
+            File::Uring(f) => uring_io(f.readv_at(bufs, offset)).await,
             File::Borrowed { fd, _guard, .. } => {
                 #[cfg(target_os = "linux")]
                 if self.uses_io_uring() {
-                    return uring_borrowed::readv_at(*fd, _guard, bufs, offset).await;
+                    return uring_io(uring_borrowed::readv_at(*fd, _guard, bufs, offset)).await;
                 }
                 let res = preadv(*fd, &mut bufs, offset);
                 (res, bufs)
@@ -178,11 +222,11 @@ impl File {
                 (res, bufs[0])
             }
             #[cfg(target_os = "linux")]
-            File::Uring(f) => f.write_at(buf, offset).submit().await,
+            File::Uring(f) => uring_io(f.write_at(buf, offset).submit()).await,
             File::Borrowed { fd, _guard, .. } => {
                 #[cfg(target_os = "linux")]
                 if self.uses_io_uring() {
-                    return uring_borrowed::write_at(*fd, _guard, buf, offset).await;
+                    return uring_io(uring_borrowed::write_at(*fd, _guard, buf, offset)).await;
                 }
                 let bufs = [buf];
                 let res = pwritev(*fd, &bufs, offset);
@@ -205,11 +249,11 @@ impl File {
                 (res, bufs)
             }
             #[cfg(target_os = "linux")]
-            File::Uring(f) => f.writev_at(bufs, offset).await,
+            File::Uring(f) => uring_io(f.writev_at(bufs, offset)).await,
             File::Borrowed { fd, _guard, .. } => {
                 #[cfg(target_os = "linux")]
                 if self.uses_io_uring() {
-                    return uring_borrowed::writev_at(*fd, _guard, bufs, offset).await;
+                    return uring_io(uring_borrowed::writev_at(*fd, _guard, bufs, offset)).await;
                 }
                 let res = pwritev(*fd, &bufs, offset);
                 (res, bufs)
@@ -350,12 +394,12 @@ mod uring_borrowed {
             .await
     }
 
-    pub(super) async fn read_at(
+    pub(super) async fn read_at<B: IoBufMut + Unpin>(
         fd: RawFd,
         guard: &Arc<dyn Any>,
-        mut buf: FileVolatileBuf,
+        mut buf: B,
         offset: u64,
-    ) -> (io::Result<usize>, FileVolatileBuf) {
+    ) -> (io::Result<usize>, B) {
         let sqe = opcode::Read::new(
             types::Fd(fd),
             buf.stable_mut_ptr(),
@@ -429,6 +473,156 @@ mod uring_borrowed {
             .offset(offset)
             .build();
         submit(sqe, bufs, iovecs, guard).await
+    }
+}
+
+/// A request whose io_uring IO on borrowed buffers may still be in flight when it's dropped.
+///
+/// It counts the io_uring IO that its future starts, until the IO completes. If it's dropped
+/// while any is in flight, it leaks the future instead, with the buffers that the IO uses.
+/// Dropping the IO would abort the process, see [`File`]. A leaked future runs none of its
+/// destructors. Its output is `None` if IO outlives the future anyway, for example because the
+/// future forgot an IO without dropping it, and then it leaks the output too, which may own the
+/// buffer. Each leak counts in the `leaked` counter it was created with.
+///
+/// Only IO that the future polls itself counts, not IO in a task that it spawned, and nested
+/// requests count IO in the innermost one only.
+pub struct TrackedRequest<F> {
+    fut: Option<ScopedRequest<F>>,
+    in_flight: Arc<AtomicUsize>,
+    leaked: Arc<AtomicUsize>,
+}
+
+impl<F: Future> TrackedRequest<F> {
+    /// Track `fut`, counting its leaks in `leaked`.
+    ///
+    /// # Safety
+    ///
+    /// The buffers of the IO that `fut` starts must belong to `fut`, or to something that `fut`
+    /// keeps alive, and once it completes, to its output. A leak keeps only those alive, so IO
+    /// into the memory of an outer request, for example, could outlive that memory.
+    pub unsafe fn new(fut: F, leaked: Arc<AtomicUsize>) -> Self {
+        let in_flight = Arc::<AtomicUsize>::default();
+        TrackedRequest {
+            fut: Some(Box::pin(CURRENT_IO.scope(in_flight.clone(), fut))),
+            in_flight,
+            leaked,
+        }
+    }
+}
+
+impl<F> TrackedRequest<F> {
+    /// Leak `value` while IO into the memory it owns may be in flight.
+    fn leak<T>(&self, value: T) {
+        let leaked = self.leaked.fetch_add(1, Ordering::Relaxed) + 1;
+        warn!(
+            "leaking a request with io_uring IO in flight, {} in all",
+            leaked
+        );
+        std::mem::forget(value);
+    }
+}
+
+impl<F: Future> Future for TrackedRequest<F> {
+    type Output = Option<F::Output>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut *self;
+        let fut = this.fut.as_mut().expect("polled after it completed");
+        let out = std::task::ready!(fut.as_mut().poll(cx));
+        // The scope dropped the future, but IO in flight may still use the memory it had.
+        let fut = this.fut.take();
+        if this.in_flight.load(Ordering::Relaxed) == 0 {
+            return Poll::Ready(Some(out));
+        }
+        this.leak((fut, out));
+        Poll::Ready(None)
+    }
+}
+
+impl<F> Drop for TrackedRequest<F> {
+    fn drop(&mut self) {
+        if self.in_flight.load(Ordering::Relaxed) > 0 {
+            if let Some(fut) = self.fut.take() {
+                self.leak(fut);
+            }
+        }
+    }
+}
+
+/// A request's future, which sees the request's in-flight counter as `CURRENT_IO`.
+type ScopedRequest<F> = Pin<Box<TaskLocalFuture<Arc<AtomicUsize>, F>>>;
+
+tokio::task_local! {
+    /// The in-flight counter of the `TrackedRequest` being polled.
+    static CURRENT_IO: Arc<AtomicUsize>;
+}
+
+/// Run `io`, a tokio-uring operation on borrowed buffers, see `UringIo`.
+#[cfg(target_os = "linux")]
+fn uring_io<F: Future>(io: F) -> UringIo<F> {
+    UringIo { io, queued: None }
+}
+
+/// A tokio-uring operation on borrowed buffers. Dropping it while the kernel may still use them
+/// aborts the process, see `File`, because tokio-uring can't cancel the operation or wait for
+/// it. It counts as in flight only once a poll returns `Pending`, so a first poll that panics
+/// stays a panic.
+#[cfg(target_os = "linux")]
+struct UringIo<F> {
+    io: F,
+    /// Set while the last poll left the operation queued.
+    queued: Option<Queued>,
+}
+
+/// Counts a queued operation in the `TrackedRequest` that started it, if any.
+#[cfg(target_os = "linux")]
+struct Queued(Option<Arc<AtomicUsize>>);
+
+#[cfg(target_os = "linux")]
+impl Queued {
+    fn new() -> Self {
+        let counter = CURRENT_IO.try_with(Arc::clone).ok();
+        if let Some(counter) = &counter {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+        Queued(counter)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Queued {
+    fn drop(&mut self) {
+        if let Some(counter) = &self.0 {
+            counter.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl<F: Future> Future for UringIo<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+        // Safe because `io` is pinned with `self`, and nothing moves it out.
+        let this = unsafe { self.get_unchecked_mut() };
+        let res = unsafe { Pin::new_unchecked(&mut this.io) }.poll(cx);
+        if res.is_pending() {
+            this.queued.get_or_insert_with(Queued::new);
+        } else {
+            this.queued = None;
+        }
+        res
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl<F> Drop for UringIo<F> {
+    fn drop(&mut self) {
+        if self.queued.is_some() {
+            error!("an io_uring operation on a borrowed buffer was dropped before it completed");
+            std::process::abort();
+        }
     }
 }
 
