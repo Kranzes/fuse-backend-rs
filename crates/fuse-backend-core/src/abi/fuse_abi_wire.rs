@@ -266,6 +266,9 @@ const REQUEST_TIMEOUT: u64 = 1_u64 << 42;
 #[cfg(feature = "fusedev-uring")]
 const OVER_IO_URING: u64 = 1_u64 << 41;
 
+// The server asks for FUSE_SYNCFS on syncfs(2) and sync(2) (protocol 7.47).
+const HAS_SYNCFS: u64 = 1_u64 << 44;
+
 // The kernel sends a supplementary group matching the parent directory's
 // group in create/mkdir/symlink/mknod requests (FUSE_EXT_GROUPS extension).
 const CREATE_SUPP_GROUP: u64 = 1_u64 << 34;
@@ -573,6 +576,15 @@ bitflags! {
         /// time (protocol 7.43). The server negotiates it when `Server::set_request_timeout()`
         /// set a timeout.
         const REQUEST_TIMEOUT = REQUEST_TIMEOUT;
+
+        /// Asks the kernel to send `Opcode::Syncfs` when `syncfs(2)` or `sync(2)` syncs the
+        /// mount (protocol 7.47, Linux 7.4). virtiofs and fuseblk mounts send it without this
+        /// flag.
+        ///
+        /// A server that doesn't answer it stalls every `sync(2)` on the system. So the kernel
+        /// offers the flag only to a server that opened `/dev/fuse` with `CAP_SYS_ADMIN` in the
+        /// initial user namespace, and ignores it from others.
+        const HAS_SYNCFS = HAS_SYNCFS;
 
         /// Indicates that the kernel sends a supplementary group matching the
         /// parent directory's group in create/mkdir/symlink/mknod requests
