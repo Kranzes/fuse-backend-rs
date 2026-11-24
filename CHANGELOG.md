@@ -522,6 +522,11 @@
   reader) and writes (`EINVAL`) while an O_DIRECT request runs on the same handle. The O_DIRECT
   request set O_DIRECT on the shared file description under the buffered IO. Now each kind
   waits until the other has left the handle.
+- [338](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/338): On Linux 6.8+, `FuseSession::umount()` and `detach()` unmount a file system
+  whose connection was aborted through `/sys/fs/fuse/connections`, as a failing
+  `UringFuseServing` worker does, instead of leaving the dead mount behind. They check the
+  unique mount ID, so they also leave alone a file system mounted at the mountpoint after the
+  session's mount was unmounted from outside while in use.
 
 ### Removed
 - [254](https://github.com/cloud-hypervisor/fuse-backend-rs/pull/254): Drop the vestigial `vhost` and `virtio-bindings` dependencies that the
